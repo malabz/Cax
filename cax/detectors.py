@@ -87,12 +87,15 @@ def environment_summary() -> dict[str, Optional[str]]:
     """Return a dictionary summarising key binaries and hardware."""
 
     ramax = executable_info("ramax", ["--version"])
+    mash = executable_info("mash", ["--version"])
     cactus_exec = executable_info("cactus", ["--version"])
     # Prefer user-specified commands when deriving the cactus version
     cactus_version = detect_cactus_version() or (cactus_exec.version)
     return {
         "ramax_path": ramax.path,
         "ramax_version": ramax.version,
+        "mash_path": mash.path,
+        "mash_version": mash.version,
         "cactus_path": cactus_exec.path,
         "cactus_version": cactus_version,
         "gpu": detect_gpu_summary(),

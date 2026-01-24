@@ -16,6 +16,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
+from textual.worker import Worker, WorkerState
 from textual.widgets import Button, Checkbox, Footer, Header, Input, ListItem, ListView, Static, TextArea
 
 from rich.console import Console, Group, RenderableType
@@ -26,7 +27,7 @@ from rich.tree import Tree
 from rich.align import Align
 from rich.console import Group
 
-from . import planner, resume as resume_utils, tree_utils
+from . import mash_auto as mash_auto_module, planner, resume as resume_utils, seq_cache, tree_utils
 from .models import Plan, Round, RunSettings, Step
 from .planner import PlannedCommand
 
@@ -145,6 +146,8 @@ def environment_summary_card(environment: dict[str, Optional[str]], resources: d
 
     table.add_row(entry("RaMAx path", environment.get("ramax_path")))
     table.add_row(entry("RaMAx version", environment.get("ramax_version")))
+    table.add_row(entry("Mash path", environment.get("mash_path")))
+    table.add_row(entry("Mash version", environment.get("mash_version")))
     table.add_row(entry("cactus path", environment.get("cactus_path")))
     table.add_row(entry("cactus version", environment.get("cactus_version")))
     table.add_row(entry("GPU", environment.get("gpu")))
@@ -406,6 +409,114 @@ class SearchModal(ModalScreen[str | None]):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+class MashThresholdModal(ModalScreen[float | None]):
+    """Modal dialog to adjust Mash distance threshold and reapply auto-selection."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    CSS = """
+    MashThresholdModal {
+        align: center middle;
+    }
+    #mash-dialog {
+        padding: 1 2;
+        min-width: 50;
+        border: round $accent;
+        background: $panel;
+        layout: vertical;
+    }
+    #mash-title {
+        padding-bottom: 1;
+    }
+    #mash-threshold {
+        width: 100%;
+    }
+    #mash-hint {
+        padding-top: 1;
+        color: $text-muted;
+    }
+    #mash-status {
+        padding-top: 1;
+        color: $error;
+    }
+    #mash-buttons {
+        padding-top: 1;
+        layout: horizontal;
+        content-align: right middle;
+    }
+    #mash-buttons Button {
+        margin-left: 1;
+    }
+    #mash-buttons Button:first-child {
+        margin-left: 0;
+    }
+    """
+
+    def __init__(self, initial: float):
+        super().__init__()
+        self.initial = initial
+        self._input: Input | None = None
+        self._status: Static | None = None
+
+    def compose(self) -> ComposeResult:
+        with Container(id="mash-dialog"):
+            yield Static("Mash distance threshold (distance ≤ threshold enables RaMAx)", id="mash-title")
+            threshold_input = Input(
+                value=f"{self.initial:.4f}",
+                placeholder="0.02",
+                id="mash-threshold",
+            )
+            self._input = threshold_input
+            yield threshold_input
+            yield Static("Example: 0.04", id="mash-hint")
+            status = Static("", id="mash-status")
+            self._status = status
+            yield status
+            with Container(id="mash-buttons"):
+                yield Button("Apply", id="mash-apply", variant="success")
+                yield Button("Cancel", id="mash-cancel")
+
+    def on_mount(self) -> None:
+        if self._input:
+            self.set_focus(self._input)
+
+    def _update_status(self, message: str | None) -> None:
+        if self._status is not None:
+            self._status.update(message or "")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _apply(self) -> None:
+        if not self._input:
+            self.dismiss(None)
+            return
+        raw = self._input.value.strip()
+        if not raw:
+            value = self.initial
+        else:
+            try:
+                value = float(raw)
+            except ValueError:
+                self._update_status("Threshold must be a number (for example 0.02).")
+                return
+        if value < 0.0 or value > 1.0:
+            self._update_status("Threshold must be between 0.0 and 1.0.")
+            return
+        self._update_status("")
+        self.dismiss(value)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "mash-threshold":
+            self._apply()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "mash-apply":
+            self._apply()
+        elif event.button.id == "mash-cancel":
+            self.action_cancel()
 
 
 @dataclass
@@ -949,6 +1060,12 @@ class AsciiPhylo(Static):
                 # Keep round state only; no extra leaf marker.
                 tag = "[RaMAx]" if effective_ramax.get(node, False) else "[Cactus]"
                 parts.append(tag)
+                if node.round.mash_distance is not None:
+                    mash_label = f"Mash:{node.round.mash_distance:.4f}"
+                    src = getattr(node.round, "mash_source", None)
+                    if src and src != node.round.root:
+                        mash_label = f"{mash_label}@{src}"
+                    parts.append(mash_label)
             return " ".join(parts)
 
         # Connectors use a fixed four-column indent and consistent heavy glyphs.
@@ -1039,16 +1156,16 @@ class AsciiPhylo(Static):
         # Pass 2: Add dotted leader and branch length
         final_lines: list[Text] = []
         target_width = max_width + 4 # Reserve gap
-
+	
         for line, node in raw_lines:
             if node.length is not None:
                 current_len = line.cell_len
                 padding = max(2, target_width - current_len)
                 dots = "." * padding
-                len_str = f" {node.length:.4g}"
-                
-                # Append dotted leader and length
+
+                # Append dotted leader and length.
                 line.append(dots, style="#6272a4")
+                len_str = f" {node.length:.4g}"
                 line.append(len_str, style="bold cyan")
             final_lines.append(line)
 
@@ -1768,7 +1885,13 @@ class RunSettingsScreen(Screen[RunSettings | None]):
         verbose = self._verbose.value if self._verbose else self.current.verbose
         ok, threads, _ = self._validate_threads()
         thread_val = threads if ok else self.current.thread_count
-        return RunSettings(verbose=verbose, thread_count=thread_val, resume=self.current.resume)
+        return RunSettings(
+            verbose=verbose,
+            thread_count=thread_val,
+            resume=self.current.resume,
+            mash_auto=self.current.mash_auto,
+            mash_distance_threshold=self.current.mash_distance_threshold,
+        )
 
     def _refresh_summary(self) -> None:
         if not self._summary:
@@ -2323,6 +2446,7 @@ class PlanUIApp(App[UIResult]):
     BINDINGS = [
         Binding("e", "edit_round", "Edit command"),
         Binding("r", "run_plan", "Run"),
+        Binding("t", "mash_threshold", "Mash threshold"),
         Binding("q", "quit", "Quit"),
         Binding("i", "show_info", "Info"),
     ]
@@ -2447,6 +2571,12 @@ class PlanUIApp(App[UIResult]):
         )
         self.push_screen(screen, self._finalize_run_settings)
 
+    def action_mash_threshold(self) -> None:
+        self.push_screen(
+            MashThresholdModal(self.run_settings.mash_distance_threshold),
+            self._apply_mash_threshold,
+        )
+
     def export_commands(self, settings: RunSettings | None = None, *, notify_detail: bool = True) -> Path | None:
         output_dir = Path(self.plan.out_dir or self.base_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -2467,8 +2597,119 @@ class PlanUIApp(App[UIResult]):
     def action_quit(self) -> None:
         self.exit(UIResult(plan=self.plan, action="quit", run_settings=self.run_settings))
 
+    def _apply_mash_threshold(self, threshold: float | None) -> None:
+        if threshold is None:
+            return
+
+        self.run_settings.mash_distance_threshold = threshold
+
+        # If Mash auto-selection is enabled and mash is available, recompute as needed (supports early-stop + 补算).
+        if self.run_settings.mash_auto and shutil.which("mash"):
+            if self.is_running:
+                self._pending_mash_threshold = threshold
+                if self.hud:
+                    self.hud.update_message(f"Computing Mash distances for threshold={threshold:.4f}...")
+
+                def work() -> mash_auto_module.MashAutoSummary:
+                    preprocess_seq_file = seq_cache.find_preprocess_input_seq_file(self.plan, base_dir=self.base_dir)
+                    return mash_auto_module.apply_mash_distance_defaults(
+                        self.plan,
+                        base_dir=self.base_dir,
+                        threshold=threshold,
+                        sequence_file=preprocess_seq_file,
+                    )
+
+                self.run_worker(
+                    work,
+                    name="mash-threshold",
+                    group="mash",
+                    description="Compute Mash distances for threshold changes",
+                    exit_on_error=False,
+                    exclusive=True,
+                    thread=True,
+                )
+                return
+
+            preprocess_seq_file = seq_cache.find_preprocess_input_seq_file(self.plan, base_dir=self.base_dir)
+            summary = mash_auto_module.apply_mash_distance_defaults(
+                self.plan,
+                base_dir=self.base_dir,
+                threshold=threshold,
+                sequence_file=preprocess_seq_file,
+            )
+            status = (
+                f"Applied Mash threshold {threshold:.4f}: enabled {summary.enabled_ramax}/{summary.computed} rounds "
+                f"(pairs: +{summary.pairwise_computed}, cached {summary.pairwise_cached})."
+            )
+        else:
+            summary = mash_auto_module.apply_mash_threshold(self.plan, threshold=threshold)
+            status = (
+                f"Applied Mash threshold {threshold:.4f}: enabled {summary.enabled_ramax}/{summary.considered} rounds "
+                f"(changed {summary.changed})."
+            )
+
+        if self.canvas:
+            self.canvas._rebuild_visual()
+            self.canvas.refresh()
+            self._on_node_selected(self.canvas.current_node(), status=status)
+        elif self.hud:
+            self.hud.update_message(status)
+
+    def on_worker_state_changed(self, message: Worker.StateChanged) -> None:
+        if message.worker.name != "mash-threshold":
+            return
+        if message.state == WorkerState.ERROR and self.hud:
+            error = message.worker.error
+            self.hud.update_message(f"[red]Mash computation failed: {error}[/red]")
+            return
+        if message.state != WorkerState.SUCCESS:
+            return
+        threshold = getattr(self, "_pending_mash_threshold", self.run_settings.mash_distance_threshold)
+        summary = message.worker.result
+        if summary is None:
+            return
+        status = (
+            f"Applied Mash threshold {threshold:.4f}: enabled {summary.enabled_ramax}/{summary.computed} rounds "
+            f"(pairs: +{summary.pairwise_computed}, cached {summary.pairwise_cached})."
+        )
+        if self.canvas:
+            self.canvas._rebuild_visual()
+            self.canvas.refresh()
+            self._on_node_selected(self.canvas.current_node(), status=status)
+        elif self.hud:
+            self.hud.update_message(status)
+
     def _round_details(self, round_entry: Round) -> list[str]:
         details = [f"[bold]{round_entry.name}[/bold] root={round_entry.root}"]
+        if round_entry.mash_distance is not None:
+            prefix = "Mash distance"
+            if round_entry.mash_reference and round_entry.mash_query:
+                prefix = f"{prefix} ({round_entry.mash_reference} vs {round_entry.mash_query})"
+            details.append(f"{prefix}: {round_entry.mash_distance:.4f}")
+            threshold = self.run_settings.mash_distance_threshold
+            details.append(
+                f"[dim]Mash note: distance ≤ {threshold:.4f} means subtree max (all pairs checked); "
+                f"distance > {threshold:.4f} means a witness pair was found (early-stop).[/dim]"
+            )
+            if round_entry.mash_source and round_entry.mash_source != round_entry.root:
+                if round_entry.mash_distance > threshold:
+                    details.append(
+                        f"[dim]Mash source: {round_entry.mash_source} (descendant witness; this node inherits the failure).[/dim]"
+                    )
+                else:
+                    details.append(
+                        f"[dim]Mash source: {round_entry.mash_source} (subtree max observed in descendant).[/dim]"
+                    )
+        elif self.run_settings.mash_auto:
+            if shutil.which("mash") is None:
+                details.append("[dim]Mash distance: (not computed — `mash` not found on PATH)[/dim]")
+            else:
+                threshold = self.run_settings.mash_distance_threshold
+                details.append("[dim]Mash distance: (not computed for this round)[/dim]")
+                details.append(
+                    f"[dim]Hint: press [bold]T[/bold] to compute Mash distances (threshold={threshold:.4f}); "
+                    "ensure sequences are local/cached.[/dim]"
+                )
         if round_entry.replace_with_ramax:
             ramax_preview = self._ramax_command_preview(round_entry)
             if ramax_preview:
@@ -2583,6 +2824,15 @@ class PlanUIApp(App[UIResult]):
                     f"Subtree summary: RaMAx {replaced}/{len(subtree_rounds)} rounds",
                 ]
             )
+            mash_values = [
+                round_entry.mash_distance
+                for round_entry in subtree_rounds
+                if round_entry.mash_distance is not None
+            ]
+            if mash_values:
+                details.append(
+                    f"Subtree Mash max: {max(mash_values):.4f} (computed {len(mash_values)}/{len(subtree_rounds)} rounds)"
+                )
         else:
             details.extend(["", "No cactus rounds in this subtree (leaf node)."])
         if status:

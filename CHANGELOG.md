@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-01-24
+
+### Mash auto-selection
+- Added tree-aware pairwise Mash distance evaluation with early-stop pruning ("prove > threshold") and persistent caching under `<out_dir>/logs/` to avoid recomputation across repeated runs.
+- PlanUI: threshold modal (`T`) recomputes and reselects rounds; tree labels show `Mash:…@source` when the displayed distance originates from a descendant witness/max to avoid misinterpretation.
+- CLI: optional prompt before computing Mash distances (includes leaf / max-pairs estimate) and stronger warning when `mash` is missing; supports caching remote sequences up front so Mash can run locally.
+
 ## [0.4.0] - 2025-12-14
 
 ### UI

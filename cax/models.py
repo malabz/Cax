@@ -71,6 +71,10 @@ class Round(BaseModel):
     workdir: Optional[str] = None
     ramax_opts: list[str] = Field(default_factory=list)
     manual_ramax_command: Optional[str] = None
+    mash_distance: Optional[float] = None
+    mash_reference: Optional[str] = None
+    mash_query: Optional[str] = None
+    mash_source: Optional[str] = None
 
     @model_validator(mode="after")
     def _validate_round(self) -> "Round":
@@ -107,3 +111,5 @@ class RunSettings:
     verbose: bool = False
     thread_count: Optional[int] = None
     resume: bool = False
+    mash_auto: bool = True
+    mash_distance_threshold: float = 0.02

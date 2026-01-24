@@ -10,7 +10,7 @@ import typer
 from rich import print
 import shutil
 
-from . import command_prompt, history, parser, ui as ui_module
+from . import command_prompt, history, mash_auto as mash_auto_module, parser, seq_cache, ui as ui_module
 from .models import Plan, RunSettings
 from .runner import PlanRunner
 
@@ -55,6 +55,33 @@ def ui(
         min=1,
         help="Override cactus/RaMAx thread count for all steps (leave unset for command defaults)",
     ),
+    mash_auto: bool = typer.Option(
+        True,
+        "--mash-auto/--no-mash-auto",
+        help=(
+            "Preselect RaMAx rounds using Mash distance (requires mash on PATH; uses -k 31 -s 20000). "
+            "Uses tree-aware pairwise checks with early-stop and caches distances under the plan output directory."
+        ),
+    ),
+    mash_threshold: float = typer.Option(
+        0.02,
+        min=0.0,
+        max=1.0,
+        help="Enable RaMAx when Mash distance <= threshold (default: 0.02).",
+    ),
+    ask_mash: bool = typer.Option(
+        True,
+        "--ask-mash/--no-ask-mash",
+        help="Prompt before computing Mash distances (recommended for large trees).",
+    ),
+    cache_seqs: bool = typer.Option(
+        False,
+        "--cache-seqs/--no-cache-seqs",
+        help=(
+            "Download remote URLs in the cactus seq file(s) into a local cache and rewrite the plan to use cached inputs "
+            "(covers both --outSeqFile and cactus-preprocess input seq files)."
+        ),
+    ),
 ) -> None:
     """Launch the interactive Textual UI for plan editing."""
 
@@ -71,7 +98,121 @@ def ui(
     resume_preselected = _ensure_clean_environment(out_dir_preview, job_store_preview)
     text = _load_prepare_text(prepare_args, from_file, executable=executable)
     plan = parser.parse_prepare_script(text)
-    run_settings = RunSettings(verbose=False, thread_count=threads, resume=resume_preselected)
+
+    base_dir = Path.cwd()
+    out_seq_path = _resolve_path(plan.out_seq_file)
+    preprocess_seq_file = seq_cache.find_preprocess_input_seq_file(plan, base_dir=base_dir)
+    out_remote = seq_cache.count_remote_sources(out_seq_path)
+    pre_remote = seq_cache.count_remote_sources(preprocess_seq_file) if preprocess_seq_file else 0
+
+    remote_source = None
+    remote_count = 0
+    if out_remote:
+        remote_source = "outSeqFile"
+        remote_count = out_remote
+    elif pre_remote:
+        remote_source = "cactus-preprocess input seq file"
+        remote_count = pre_remote
+
+    if mash_auto and remote_count and not cache_seqs:
+        cache_seqs = typer.confirm(
+            f"[cax] Detected {remote_count} remote sequence URL(s) in {remote_source}. "
+            "Cache/download them now to enable Mash distance and avoid repeated downloads?",
+            default=True,
+        )
+
+    if cache_seqs:
+        try:
+            before_out_seq = plan.out_seq_file
+            before_pre_seq = preprocess_seq_file
+            summary = seq_cache.apply_sequence_cache(plan, base_dir=base_dir)
+            if summary.rewritten:
+                after_pre_seq = seq_cache.find_preprocess_input_seq_file(plan, base_dir=base_dir)
+                detail = ""
+                if before_out_seq != plan.out_seq_file:
+                    detail = f"Using cached outSeqFile: {plan.out_seq_file}"
+                elif before_pre_seq and after_pre_seq and before_pre_seq != after_pre_seq:
+                    detail = f"Using cached cactus-preprocess input seq file: {after_pre_seq}"
+                typer.echo(
+                    f"[cax] Cached sequences: downloaded {summary.downloaded} file(s). "
+                    f"Cache dir: {seq_cache.default_cache_dir()} | "
+                    f"{detail or 'Cached seq file applied.'}"
+                )
+        except Exception as exc:
+            typer.echo(f"[cax] Sequence cache failed: {exc}", err=True)
+
+    if mash_auto:
+        mash_path = shutil.which("mash")
+        if not mash_path:
+            typer.echo(
+                "[cax] WARNING: Mash auto-selection is enabled, but `mash` was not found on PATH.\n"
+                "  - Install Mash (e.g. conda/brew/apt) or make sure it's on PATH.\n"
+                "  - Or re-run with `--no-mash-auto` to skip Mash defaults.",
+                err=True,
+            )
+        else:
+            preprocess_seq_file = seq_cache.find_preprocess_input_seq_file(plan, base_dir=base_dir)
+            out_seq_path = _resolve_path(plan.out_seq_file)
+            out_remote = seq_cache.count_remote_sources(out_seq_path)
+            pre_remote = seq_cache.count_remote_sources(preprocess_seq_file) if preprocess_seq_file else 0
+            remote_source = None
+            remote_count = 0
+            if out_remote:
+                remote_source = "outSeqFile"
+                remote_count = out_remote
+            elif pre_remote:
+                remote_source = "cactus-preprocess input seq file"
+                remote_count = pre_remote
+
+            do_mash = True
+            if ask_mash:
+                seq_for_estimate = preprocess_seq_file or out_seq_path
+                leaf_count = _estimate_leaf_count(seq_for_estimate)
+                pair_count = leaf_count * (leaf_count - 1) // 2 if leaf_count >= 2 else 0
+                cache_hint = Path(plan.out_dir or base_dir) / "logs"
+                do_mash = typer.confirm(
+                    f"[cax] Compute Mash distances now? (leaves={leaf_count}, max_pairs={pair_count}) "
+                    f"Results are cached under: {cache_hint}",
+                    default=True,
+                )
+
+            if do_mash:
+                typer.echo(
+                    f"[cax] Computing Mash distances (k=31, s=20000, threshold={mash_threshold:.4f})..."
+                )
+                summary = mash_auto_module.apply_mash_distance_defaults(
+                    plan,
+                    base_dir=base_dir,
+                    threshold=mash_threshold,
+                    sequence_file=preprocess_seq_file,
+                )
+                if summary.computed:
+                    typer.echo(
+                        f"[cax] Mash complete: computed {summary.computed} round(s), "
+                        f"auto-enabled RaMAx for {summary.enabled_ramax}. "
+                        f"(pairs: +{summary.pairwise_computed}, cached {summary.pairwise_cached})"
+                    )
+                else:
+                    if remote_count and not cache_seqs:
+                        typer.echo(
+                            f"[cax] Mash skipped: {remote_source} references remote URLs. "
+                            "Re-run with `--cache-seqs` to download/cache sequences first.",
+                            err=True,
+                        )
+                    else:
+                        typer.echo(
+                            "[cax] Mash skipped: no eligible local sequences were found to compute distances.",
+                            err=True,
+                        )
+            else:
+                typer.echo("[cax] Skipped Mash distance computation. (You can still edit RaMAx selections manually.)")
+    run_settings = RunSettings(
+        verbose=False,
+        thread_count=threads,
+        resume=resume_preselected,
+        mash_auto=mash_auto,
+        mash_distance_threshold=mash_threshold,
+    )
 
     # 若用户在启动时选择保留 run_state，UI 会自动进入续跑专属界面（可查看已完成/待执行并微调后续命令）。
     result = ui_module.launch(plan, run_settings=run_settings)
@@ -127,7 +268,13 @@ def _prompt_run_settings(defaults: RunSettings, plan: Plan | None = None) -> Run
         thread_count = value
         break
 
-    settings = RunSettings(verbose=verbose, thread_count=thread_count, resume=resume)
+    settings = RunSettings(
+        verbose=verbose,
+        thread_count=thread_count,
+        resume=resume,
+        mash_auto=defaults.mash_auto,
+        mash_distance_threshold=defaults.mash_distance_threshold,
+    )
 
     return settings
 
@@ -253,3 +400,28 @@ def _resolve_path(path_like: str) -> Path:
     if path.is_absolute():
         return path
     return (Path.cwd() / path).resolve()
+
+
+def _estimate_leaf_count(seq_file: Path) -> int:
+    """Best-effort leaf count estimator for an outSeqFile-style file."""
+
+    try:
+        lines = seq_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+    idx = 0
+    while idx < len(lines) and not lines[idx].strip():
+        idx += 1
+    if idx >= len(lines):
+        return 0
+    idx += 1  # skip Newick line
+    count = 0
+    for line in lines[idx:]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split()
+        if len(parts) < 2:
+            continue
+        count += 1
+    return count
