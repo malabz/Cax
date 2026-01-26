@@ -17,6 +17,7 @@ SECTION_PREPROC_RE = re.compile(r"^##\s*Preprocessor", re.IGNORECASE)
 SECTION_ALIGNMENT_RE = re.compile(r"^##\s*Alignment", re.IGNORECASE)
 SECTION_HALMERGE_RE = re.compile(r"^##\s*HAL\s+merg", re.IGNORECASE)
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+HAL_APPEND_LOG_RE = re.compile(r"^halAppend-(?P<root>.+)\.log$", re.IGNORECASE)
 
 
 def _strip_ansi(value: str) -> str:
@@ -260,7 +261,10 @@ def _classify_kind(first_token: str, default_kind: Optional[str]) -> str:
         "cactus-blast": "blast",
         "cactus-align": "align",
         "hal2fasta": "hal2fasta",
+        "cactus-hal2fasta": "hal2fasta",
         "halAppendSubtree": "halmerge",
+        "cactus-halAppendSubtree": "halmerge",
+        "cactus-halAppendSubtrees": "halmerge",
         "ramax": "ramax",
         "RaMAx": "ramax",
     }
@@ -282,8 +286,12 @@ def _extract_jobstore(tokens: list[str]) -> Optional[str]:
 
 
 def _extract_root(tokens: list[str], kind: str) -> Optional[str]:
-    if kind == "halmerge" and len(tokens) >= 4:
-        return tokens[3]
+    if kind == "halmerge":
+        log_root = _extract_halmerge_root_from_log(tokens)
+        if log_root:
+            return log_root
+        if len(tokens) >= 4:
+            return tokens[3]
     for idx, tok in enumerate(tokens):
         if tok == "--root" and idx + 1 < len(tokens):
             return tokens[idx + 1]
@@ -325,6 +333,17 @@ def _extract_outputs(tokens: list[str], kind: str) -> list[str]:
         for token in tokens:
             _maybe_add(token)
     return outputs
+
+
+def _extract_halmerge_root_from_log(tokens: list[str]) -> Optional[str]:
+    log_file = _extract_log_file(tokens)
+    if not log_file:
+        return None
+    log_name = log_file.split("/")[-1]
+    match = HAL_APPEND_LOG_RE.match(log_name)
+    if match:
+        return match.group("root")
+    return None
 
 
 def _extract_prepare_args(command: str) -> dict[str, str]:

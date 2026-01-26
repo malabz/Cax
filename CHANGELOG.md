@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.1] - 2026-01-26
+
+### Parser
+- Added support for the latest cactus-prepare output format, including `cactus-hal2fasta` and `cactus-halAppendSubtrees`, while preserving legacy parsing.
+- Improved halmerge root inference from log filenames to keep RaMAx hal-merge skipping behavior consistent.
+
+### Tests
+- Added coverage for parsing the 9.1.2-style cactus-prepare output sample.
+
 ## [0.6.0] - 2026-01-26
 
 ### CLI

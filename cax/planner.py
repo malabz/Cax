@@ -352,7 +352,7 @@ def _skip_halmerge_for_ramax_parent(step: Step, tree: Optional[tree_utils.Alignm
     """Skip halAppendSubtree when its parent round was produced by RaMAx to avoid writing HAL twice."""
 
     if tree is None or step.root is None:
-        return False
+        return _skip_halmerge_for_ramax_parent_fallback(step, tree)
     node = tree.find(step.root)
     if node is None:
         return False
@@ -362,4 +362,21 @@ def _skip_halmerge_for_ramax_parent(step: Step, tree: Optional[tree_utils.Alignm
         parent = parent.parent
     if parent and parent.round and parent.round.replace_with_ramax:
         return True
+    return False
+
+
+def _skip_halmerge_for_ramax_parent_fallback(
+    step: Step,
+    tree: Optional[tree_utils.AlignmentTree],
+) -> bool:
+    if tree is None:
+        return False
+    first_hal = next((path for path in step.out_files if path.endswith(".hal")), None)
+    if not first_hal:
+        return False
+    for round_entry in tree.iter_rounds():
+        if round_entry.target_hal == first_hal:
+            return round_entry.replace_with_ramax
+        if Path(round_entry.target_hal).name == Path(first_hal).name:
+            return round_entry.replace_with_ramax
     return False
