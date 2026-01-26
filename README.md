@@ -1,6 +1,6 @@
 # Cactus-RaMAx
 
-Cactus-RaMAx helps you remix alignment plans emitted by `cactus-prepare`. You can inspect every round, toggle RaMAx for any subtree, and then run or export the resulting command list. The current version (`0.5.0`) keeps the ASCII phylogenetic canvas with subtree/single-node toggle scopes, search, proportional branch spacing, and a bottom HUD that summarizes the current node, coverage, and live system metrics. Subtree Mode is a CAX-only toggle that disables descendant RaMAx automatically and gracefully reverts if you later edit a child node.
+Cactus-RaMAx helps you remix alignment plans emitted by `cactus-prepare`. You can inspect every round, toggle RaMAx for any subtree, and then run or export the resulting command list. The current version (`0.6.0`) keeps the ASCII phylogenetic canvas with subtree/single-node toggle scopes, search, proportional branch spacing, and a bottom HUD that summarizes the current node, coverage, and live system metrics. Subtree Mode is a CAX-only toggle that disables descendant RaMAx automatically and gracefully reverts if you later edit a child node.
 
 ## Environment setup
 
@@ -66,6 +66,33 @@ cax
   - UX: by default, CAX will ask before computing Mash (`--no-ask-mash` to skip the prompt). Mash pair distances are cached under `<out_dir>/logs/` so repeated runs are fast. In the tree, `Mash:0.0145@cb` means the value comes from descendant node `cb` (a witness / max source), not necessarily the current node.
 - If your inputs reference remote URLs (either directly in `--outSeqFile` or via the `cactus-preprocess` input seq file, as in the bundled Evolver examples), pass `--cache-seqs` to download them into a local cache and rewrite the plan to use the cached files. This avoids repeated downloads during cactus execution and enables Mash auto-selection to run on local inputs.
   - When Mash auto-selection is enabled (default), CAX will prompt you to cache remote URLs automatically before the UI opens.
+
+### 1b. Run without UI (auto mode)
+
+`cax auto` skips the UI and executes the plan immediately. Auto mode **requires Mash** (it will exit if `mash` is missing).
+
+**Recommended short form (seqfile + threshold):**
+
+```bash
+cax auto --seqfile examples/evolverMammals.txt --mash-threshold 0.02
+```
+
+This auto-generates output paths using the seqfile stem:
+`~/.cax/outputs/<stem>/<stem>.txt` (outSeqFile), `<stem>.hal` (outHal), and `jobstore` (jobStore).
+
+**Full control (optional):**
+
+```bash
+cax auto --prepare-args "examples/evolverMammals.txt --outDir steps-output --outSeqFile ... --outHal ... --jobStore jobstore"
+```
+
+Or parse an existing prepare output:
+
+```bash
+cax auto --from-file steps-output/prepare_output.txt
+```
+
+Use `--no-ask-mash` to skip the Mash confirmation prompt. Use `--cache-seqs` to download remote URLs before Mash computation.
 
 ### 2. Work inside the UI
 

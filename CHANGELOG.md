@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-01-26
+
+### CLI
+- Added `cax auto` to run Mash-based auto-selection and execute without launching the UI; supports `--seqfile` for a short-form input and enforces Mash presence in auto mode.
+- Auto mode now refreshes the cached preprocess seq file before Mash so cached local inputs are honored when URLs were downloaded.
+
 ## [0.5.0] - 2026-01-24
 
 ### Mash auto-selection
