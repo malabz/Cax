@@ -5,3 +5,8 @@ tests/__pycache__/
 cax_all_code.txt
 *.pyc
 .agentdocs/
+site/node_modules/
+site/dist/
+site/*.tsbuildinfo
+site/vite.config.d.ts
+site/vite.config.js
