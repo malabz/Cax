@@ -9,7 +9,11 @@ We recommend creating a fresh Conda environment and installing the project in ed
 ```bash
 conda create -n cax python=3.10 -y
 conda activate cax
-
+# Run the cactus installation script, or install cactus yourself.
+bash cactus-install.sh
+# install ramax
+conda install -c malab ramax
+# install cax
 pip install -e .
 ```
 
@@ -18,20 +22,6 @@ Alternatively, you can build a wheel and install it in a different environment:
 ```bash
 python -m build
 pip install dist/cactus_ramax-*.whl
-```
-
-### Optional but recommended: install Mash
-
-Mash is used for automatic RaMAx preselection (Mash distance). If `mash` is not available on `PATH`, you can still use CAX normally, but Mash-based defaults and threshold recomputation will be skipped.
-
-Common install options:
-
-```bash
-# Conda (recommended)
-conda install -c bioconda mash
-
-# Homebrew (macOS)
-brew install mash
 ```
 
 ## Quick start
