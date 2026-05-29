@@ -60,6 +60,21 @@ def _is_effective_ramax_node(node: tree_utils.AlignmentNode) -> bool:
     return False
 
 
+def _node_display_name(node: tree_utils.AlignmentNode) -> str:
+    if node.round:
+        return node.round.root
+    if node.name:
+        return node.name
+    return "Root" if getattr(node, "parent", None) is None else "clade"
+
+
+def _node_search_text(node: tree_utils.AlignmentNode) -> str:
+    parts = [node.name]
+    if node.round:
+        parts.extend([node.round.root, node.round.name])
+    return " ".join(part for part in parts if part).lower()
+
+
 @dataclass
 class UIResult:
     plan: Plan
@@ -738,9 +753,10 @@ class AsciiPhylo(Static):
 
         self._rebuild_visual()
         self.refresh()
+        ancestor_label = _node_display_name(ancestor_conflict)
         self._notify(
             node,
-            f"Conflict: Subtree mode on ancestor '{ancestor_conflict.name}' has been disabled.",
+            f"Conflict: Subtree mode on ancestor '{ancestor_label}' has been disabled.",
         )
         
         # Show modal
@@ -754,7 +770,7 @@ class AsciiPhylo(Static):
                 InfoModal(
                     "Subtree Mode Disabled",
                     (
-                        f"The ancestor node '{ancestor_conflict.name}' was in Subtree Mode.\n\n"
+                        f"The ancestor node '{ancestor_label}' was in Subtree Mode.\n\n"
                         "Since you are modifying a child node independently, the ancestor's "
                         "subtree-wide replacement has been cancelled to avoid conflicts."
                     ),
@@ -788,7 +804,7 @@ class AsciiPhylo(Static):
             return
         self._search_term = cleaned
         self._hits = [
-            node for node in self._linear if cleaned in (node.name or "").lower()
+            node for node in self._linear if cleaned in _node_search_text(node)
         ]
         self._hit_index = 0
         if self._hits:
@@ -1034,7 +1050,6 @@ class AsciiPhylo(Static):
         return None
 
     def _rebuild_visual(self) -> None:
-        glyphs = self._glyphs()
         highlight_subtree = self._toggle_scope == "subtree"
         highlighted_nodes: set[tree_utils.AlignmentNode] = set()
         if highlight_subtree and self._cursor:
@@ -1052,98 +1067,92 @@ class AsciiPhylo(Static):
 
         propagate_effective(self._root, False)
 
-        def label_for(node: tree_utils.AlignmentNode) -> str:
-            """Return the full label text without truncation."""
-            name = node.name or "(unnamed)"
-            parts = [name]
+        def node_kind(node: tree_utils.AlignmentNode) -> str:
+            if node.round and effective_ramax.get(node, False):
+                return "ramax"
             if node.round:
-                # Keep round state only; no extra leaf marker.
-                tag = "[RaMAx]" if effective_ramax.get(node, False) else "[Cactus]"
-                parts.append(tag)
-                if node.round.mash_distance is not None:
-                    mash_label = f"Mash:{node.round.mash_distance:.4f}"
-                    src = getattr(node.round, "mash_source", None)
-                    if src and src != node.round.root:
-                        mash_label = f"{mash_label}@{src}"
-                    parts.append(mash_label)
-            return " ".join(parts)
+                return "cactus"
+            if node.children:
+                return "clade"
+            return "leaf"
 
-        # Connectors use a fixed four-column indent and consistent heavy glyphs.
-        tee = "┣━━ "
-        elbow = "┗━━ "
-        pipe = "┃   "
-        space = "    "
+        def display_name(node: tree_utils.AlignmentNode) -> str:
+            return _node_display_name(node)
+
+        def append_node_label(line: Text, node: tree_utils.AlignmentNode) -> None:
+            kind = node_kind(node)
+            marker_by_kind = {
+                "ramax": "R",
+                "cactus": "C",
+                "clade": "◇" if not self._ascii_only else "o",
+                "leaf": "●" if not self._ascii_only else "*",
+            }
+            marker_style_by_kind = {
+                "ramax": "bold #f59e0b",
+                "cactus": "bold #22d3ee",
+                "clade": "dim #7dd3fc",
+                "leaf": "#86efac",
+            }
+            name_style_by_kind = {
+                "ramax": "bold #fbbf24",
+                "cactus": "bold #67e8f9",
+                "clade": "dim #93c5fd",
+                "leaf": "#bbf7d0",
+            }
+
+            if node is self._cursor:
+                line.append("▸ " if not self._ascii_only else "> ", style="bold #c084fc")
+                name_style = "bold #f8fafc on #4c1d95"
+            elif highlight_subtree and node in highlighted_nodes and node.round:
+                line.append("• " if not self._ascii_only else "+ ", style="#94a3b8")
+                name_style = name_style_by_kind[kind]
+            else:
+                line.append("  ", style="dim #334155")
+                name_style = name_style_by_kind[kind]
+
+            line.append(marker_by_kind[kind], style=marker_style_by_kind[kind])
+            line.append(" ")
+            line.append(display_name(node), style=name_style)
+
+            if node.round and node.round.mash_distance is not None:
+                mash_label = f" mash {node.round.mash_distance:.4f}"
+                src = getattr(node.round, "mash_source", None)
+                if src and src != node.round.root:
+                    mash_label = f"{mash_label}@{src}"
+                line.append(mash_label, style="dim #94a3b8")
+
+            if node.length is not None:
+                line.append(f" · {node.length:.4g}", style="dim #64748b")
+
+        if self._ascii_only:
+            tee = "+- "
+            elbow = "`- "
+            pipe = "|  "
+            space = "   "
+        else:
+            tee = "├─ "
+            elbow = "└─ "
+            pipe = "│  "
+            space = "   "
 
         # Pass 1: Build base lines and calculate max width
-        raw_lines: list[tuple[Text, tree_utils.AlignmentNode]] = []
+        final_lines: list[Text] = []
         self._x_map.clear()
         self._y_map.clear()
-        max_width = 0
 
         def walk(node: tree_utils.AlignmentNode, prefix: str, is_last: bool, depth: int) -> None:
             connector = "" if depth == 0 else (elbow if is_last else tee)
-            
-            # --- Icon Selection ---
-            if not node.children:
-                # Leaf Node: Nature/Green theme
-                icon = "● " 
-            else:
-                # Ancestor Node: Structure/Blue theme
-                icon = "◈ "
-
-            # --- RaMAx State Indicator (Scheme A) ---
-            indicator_char = "│" # Default
-            indicator_style = "#6272a4" 
-
-            if node.round and effective_ramax.get(node, False):
-                indicator_char = "❚" # Golden bar
-                indicator_style = "#fcbf49"
-
             line = Text()
-            line.append(indicator_char, style=indicator_style)
-            
-            # Prefix carries the vertical indentation from ancestors; render it with a uniform cool-gray style.
-            line.append(prefix, style="#6272a4")
+            line.append(prefix, style="#475569")
             if connector:
-                line.append(connector, style="#6272a4")
-            
-            label_text = label_for(node)
-            display_text_object = Text()
+                line.append(connector, style="#475569")
+            append_node_label(line, node)
 
-            # --- Scheme A: Cursor Highlight ---
-            if node is self._cursor:
-                # High-contrast background (bright purple) and bold brackets
-                display_text_object.append(f"【 {icon}{label_text} 】", style="bold #1e1e2e on #bd93f9")
-            
-            # --- Scheme A: RaMAx State ---
-            elif node.round and effective_ramax.get(node, False):
-                display_text_object.append(f"{icon}{label_text}", style="bold #1e1e2e on #fcbf49")
-            
-            # --- Scheme A: Subtree Scope Highlight ---
-            elif highlight_subtree and node in highlighted_nodes:
-                if self._ascii_only:
-                    display_text_object.append(f"[ {icon}{label_text} ]", style="bold #1e1e2e on #94a3b8")
-                else:
-                    display_text_object.append(f"〔 {icon}{label_text} 〕", style="bold #1e1e2e on #2d3b55")
-            
-            # --- Default: Leaf vs Ancestor Distinction ---
-            elif not node.children:
-                # Leaf: Green, lighter weight
-                display_text_object.append(f"{icon}{label_text}", style="#a6e3a1") 
-            else:
-                # Ancestor: Blue, Bold
-                display_text_object.append(f"{icon}{label_text}", style="bold #89b4fa")
-            
-            line.append(display_text_object)
-
-            nonlocal max_width
-            max_width = max(max_width, line.cell_len)
-            
-            y = len(raw_lines)
+            y = len(final_lines)
             x = len(prefix) + (0 if depth == 0 else len(connector))
             self._x_map[node] = x
             self._y_map[node] = y
-            raw_lines.append((line, node))
+            final_lines.append(line)
 
             children = self._ordered_children.get(node, [])
             for idx, child in enumerate(children):
@@ -1153,25 +1162,9 @@ class AsciiPhylo(Static):
 
         walk(self._root, "", True, 0)
 
-        # Pass 2: Add dotted leader and branch length
-        final_lines: list[Text] = []
-        target_width = max_width + 4 # Reserve gap
-	
-        for line, node in raw_lines:
-            if node.length is not None:
-                current_len = line.cell_len
-                padding = max(2, target_width - current_len)
-                dots = "." * padding
-
-                # Append dotted leader and length.
-                line.append(dots, style="#6272a4")
-                len_str = f" {node.length:.4g}"
-                line.append(len_str, style="bold cyan")
-            final_lines.append(line)
-
         self._linear = sorted(self._y_map.keys(), key=lambda n: (self._y_map[n], self._x_map[n]))
         self._content_height = len(final_lines)
-        self._content_width = max((len(t.plain) for t in final_lines), default=0)
+        self._content_width = max((t.cell_len for t in final_lines), default=0)
         self._view_x = 0
         self._view_y = 0
         self._visual = Text("\n").join(final_lines)
@@ -1377,7 +1370,7 @@ class DashboardHUD(Static):
             mode_name = "Leaf Genome"
             theme_color = "green"
             file_type = "FASTA"
-            target_file = node.name or "(leaf)"
+            target_file = _node_display_name(node)
 
         base_dir = getattr(self.app, "base_dir", Path.cwd())
         grid = Table.grid(expand=True, padding=(0, 2))
@@ -1391,10 +1384,10 @@ class DashboardHUD(Static):
         id_table.add_column(justify="left", ratio=1)
 
         # Row 1: Node Name
-        id_table.add_row("Node", Text(f"{mode_icon} {node.name or 'Unknown'}", style="bold white"))
+        id_table.add_row("Node", Text(f"{mode_icon} {_node_display_name(node)}", style="bold white"))
         
         # Row 2: Parent & Length
-        parent_name = node.parent.name if getattr(node, "parent", None) else "None (Root)"
+        parent_name = _node_display_name(node.parent) if getattr(node, "parent", None) else "None (Root)"
         length_val = getattr(node, "length", None)
         length_str = f"{length_val:.4g}" if length_val is not None else "-"
         
@@ -1974,222 +1967,67 @@ class RunSettingsScreen(Screen[RunSettings | None]):
         if not self.plan.rounds:
             return Text("No rounds planned.", style="dim red")
 
-        node_map: dict[str, Round] = {r.root: r for r in self.plan.rounds}
         phylo_root = getattr(self.app, "alignment_tree", None)
         if not phylo_root:
-             return Text("Phylogeny tree missing.", style="dim red")
-        
-        @dataclass
-        class TreeNode:
-            round_entry: Round | None
-            name: str
-            children: list["TreeNode"]
-            width: int = 0
-            x: int = 0
-            y: int = 0
-            is_clustered: bool = False
-            
-        def build_node(phylo_node: tree_utils.AlignmentNode) -> TreeNode:
-            r = node_map.get(phylo_node.name)
-            c_nodes = [build_node(c) for c in phylo_node.children]
-            return TreeNode(round_entry=r, name=phylo_node.name, children=c_nodes)
+            return Text("Phylogeny tree missing.", style="dim red")
 
-        root_tree_node = build_node(phylo_root.root)
+        def has_round(node: tree_utils.AlignmentNode) -> bool:
+            if node.round:
+                return True
+            return any(has_round(child) for child in node.children)
 
-        def is_relevant(tn: TreeNode) -> bool:
-            if tn.round_entry: return True
-            return any(is_relevant(c) for c in tn.children)
+        if not has_round(phylo_root.root):
+            return Text("No active rounds in tree.", style="dim yellow")
 
-        if not is_relevant(root_tree_node):
-             return Text("No active rounds in tree.", style="dim yellow")
+        effective_ramax: dict[tree_utils.AlignmentNode, bool] = {}
 
-        # Analyze Connectivity and Propagate Subtree Mode
-        def analyze_connectivity(tn: TreeNode, override_as_input: bool = False):
-            if override_as_input:
-                # If a parent is in Subtree Mode, this node ceases to be a Round
-                # and becomes a raw input source for the parent.
-                tn.round_entry = None
-            
-            is_ramax = tn.round_entry and tn.round_entry.replace_with_ramax
-            is_subtree_mode = is_ramax and "--subtree-mode" in tn.round_entry.ramax_opts
-            
-            if is_subtree_mode:
-                tn.is_clustered = True
-                # Propagate the override to all children
-                for c in tn.children:
-                    analyze_connectivity(c, override_as_input=True)
-            else:
-                tn.is_clustered = False
-                # Continue normal recursion
-                for c in tn.children:
-                    analyze_connectivity(c, override_as_input=override_as_input)
+        def propagate_effective(node: tree_utils.AlignmentNode, covered: bool) -> None:
+            effective_ramax[node] = bool(node.round and (node.round.replace_with_ramax or covered))
+            subtree_cover = covered or bool(node.round and _is_subtree_mode_round(node.round))
+            for child in node.children:
+                propagate_effective(child, subtree_cover)
 
-        analyze_connectivity(root_tree_node)
+        propagate_effective(phylo_root.root, False)
 
-        # Layout constants
-        BOX_WIDTH = 14
-        H_GAP = 2
-        V_GAP = 2
-
-        def measure_width(tn: TreeNode) -> int:
-            if not tn.children:
-                tn.width = BOX_WIDTH
-                return BOX_WIDTH
-            c_width = sum(measure_width(c) for c in tn.children) + (len(tn.children) - 1) * H_GAP
-            tn.width = max(BOX_WIDTH, c_width)
-            return tn.width
-
-        measure_width(root_tree_node)
-
-        def layout(tn: TreeNode, start_x: int, depth: int):
-            tn.y = depth * (3 + V_GAP)
-            tn.x = start_x + tn.width // 2
-            
-            total_c_width = sum(c.width for c in tn.children) + (max(0, len(tn.children)-1) * H_GAP)
-            c_start_x = tn.x - total_c_width // 2
-            
-            for c in tn.children:
-                layout(c, c_start_x, depth + 1)
-                c_start_x += c.width + H_GAP
-
-        layout(root_tree_node, 0, 0)
-
-        max_w = root_tree_node.width
-        max_h = 0
-        def get_max_h(tn):
-            nonlocal max_h
-            max_h = max(max_h, tn.y + 3)
-            for c in tn.children: get_max_h(c)
-        get_max_h(root_tree_node)
-
-        # Pixel buffer: (x, y) -> (char, style)
-        pixels: dict[tuple[int, int], tuple[str, str]] = {}
-
-        def put(x, y, char, style="white"):
-            if 0 <= y < max_h + 10 and 0 <= x < max_w + 10:
-                pixels[(x, y)] = (char, style)
-
-        def draw_node_recursive(tn: TreeNode):
-            left = tn.x - BOX_WIDTH // 2
-            top = tn.y
-            
-            is_ramax = tn.round_entry and tn.round_entry.replace_with_ramax
-            
-            if tn.round_entry:
-                if is_ramax:
-                    color = "yellow"
-                    border_color = "yellow"
-                    icon = "R"
-                    use_double = tn.is_clustered
-                else:
-                    color = "cyan"
-                    border_color = "blue"
-                    icon = "C"
-                    use_double = False
-            else:
-                color = "green"
-                border_color = "dim green"
-                icon = "L"
-                use_double = False
-            
-            # Box Chars
-            if use_double:
-                tl, tr, bl, br = "╔", "╗", "╚", "╝"
-                h, v = "═", "║"
-            else:
-                tl, tr, bl, br = "┌", "┐", "└", "┘"
-                h, v = "─", "│"
-            
-            # Box Drawing
-            put(left, top, tl, border_color)
-            for i in range(1, BOX_WIDTH-1): put(left+i, top, h, border_color)
-            put(left+BOX_WIDTH-1, top, tr, border_color)
-            
-            put(left, top+1, v, border_color)
-            
-            raw_label = tn.name
-            content_space = BOX_WIDTH - 2
-            full_str = f"{icon} {raw_label}"
-            if len(full_str) > content_space:
-                full_str = f"{icon} {raw_label[:content_space-4]}.."
-            
-            padding_left = (content_space - len(full_str)) // 2
-            start_x = left + 1 + padding_left
-            
-            put(start_x, top+1, icon, color)
-            for i, char in enumerate(full_str):
-                if i == 0: continue
-                put(start_x + i, top+1, char, "bold white")
-                
-            put(left+BOX_WIDTH-1, top+1, v, border_color)
-            
-            put(left, top+2, bl, border_color)
-            for i in range(1, BOX_WIDTH-1): put(left+i, top+2, h, border_color)
-            put(left+BOX_WIDTH-1, top+2, br, border_color)
-
-            # Connections
-            if tn.children:
-                put(tn.x, top+2, "┴", border_color)
-                
-                mid_y = top + 3
-                put(tn.x, mid_y, "│", border_color)
-                
-                min_cx = min(c.x for c in tn.children)
-                max_cx = max(c.x for c in tn.children)
-                
-                for x in range(min_cx, max_cx + 1):
-                    char = "─"
-                    line_style = "dim white"
-                    
-                    if x == tn.x: char = "┼"
-                    elif x == min_cx: char = "┌"
-                    elif x == max_cx: char = "┐"
-                    
-                    is_child_stem = any(c.x == x for c in tn.children)
-                    if is_child_stem:
-                        if char == "─": char = "┬"
-                        if char == "┌": char = "┌"
-                        if char == "┐": char = "┐"
-                        if char == "┼": char = "┼"
-                    
-                    put(x, mid_y, char, line_style)
-
-                for c in tn.children:
-                    child_is_ramax = c.round_entry and c.round_entry.replace_with_ramax
-                    if is_ramax and child_is_ramax:
-                        conn_style = "yellow"
-                    else:
-                        conn_style = "dim white"
-                        
-                    put(c.x, mid_y+1, "↓", conn_style)
-
-            for c in tn.children:
-                draw_node_recursive(c)
-
-        draw_node_recursive(root_tree_node)
-
-        if not pixels: return Text("Empty Tree", style="red")
-
-        sorted_pixels = sorted(pixels.items(), key=lambda item: (item[0][1], item[0][0]))
+        tee = "├─ "
+        elbow = "└─ "
+        pipe = "│  "
+        space = "   "
         final_text = Text()
-        row_map: dict[int, list[tuple[int, str, str]]] = {}
-        
-        for (x, y), (char, style) in sorted_pixels:
-            if y not in row_map: row_map[y] = []
-            row_map[y].append((x, char, style))
 
-        min_x = min(k[0] for k in pixels.keys())
-        
-        for y in sorted(row_map.keys()):
-            row_pixels = row_map[y]
-            cursor = min_x
-            for x, char, style in row_pixels:
-                if x > cursor:
-                    final_text.append(" " * (x - cursor))
-                final_text.append(char, style=style)
-                cursor = x + 1
+        def append_label(line: Text, node: tree_utils.AlignmentNode) -> None:
+            if node.round:
+                if effective_ramax.get(node, False):
+                    line.append("R ", style="bold #f59e0b")
+                    line.append(_node_display_name(node), style="bold #fbbf24")
+                    if _is_subtree_mode_round(node.round):
+                        line.append("  subtree", style="dim #fbbf24")
+                else:
+                    line.append("C ", style="bold #22d3ee")
+                    line.append(_node_display_name(node), style="bold #67e8f9")
+            elif node.children:
+                line.append("◇ ", style="dim #7dd3fc")
+                line.append(_node_display_name(node), style="dim #93c5fd")
+            else:
+                line.append("L ", style="#86efac")
+                line.append(_node_display_name(node), style="#bbf7d0")
+
+        def walk(node: tree_utils.AlignmentNode, prefix: str, is_last: bool, depth: int) -> None:
+            connector = "" if depth == 0 else (elbow if is_last else tee)
+            line = Text()
+            line.append(prefix, style="#475569")
+            if connector:
+                line.append(connector, style="#475569")
+            append_label(line, node)
+            final_text.append_text(line)
             final_text.append("\n")
 
+            children = node.children
+            for idx, child in enumerate(children):
+                child_prefix = prefix + (space if is_last else pipe)
+                walk(child, child_prefix, idx == len(children) - 1, depth + 1)
+
+        walk(phylo_root.root, "", True, 0)
         return final_text
 
     def _flow_preview_width(self) -> int:
@@ -2813,7 +2651,7 @@ class PlanUIApp(App[UIResult]):
         if node.round:
             details.extend(self._round_details(node.round))
         else:
-            title = node.name or "(unnamed node)"
+            title = _node_display_name(node)
             details.append(f"[bold]{title}[/bold]")
         subtree_rounds = list(node.iter_rounds())
         if subtree_rounds:
@@ -2839,7 +2677,7 @@ class PlanUIApp(App[UIResult]):
             details.extend(["", f"[green]{status}[/green]"])
         self._last_detail_text = "\n".join(details)
         if self.hud:
-            self.hud.update_message(Panel(self._last_detail_text, title=node.round.name if node.round else (node.name or "Node"), border_style="green" if node.round and node.round.replace_with_ramax else "cyan", padding=(1, 1)))
+            self.hud.update_message(Panel(self._last_detail_text, title=_node_display_name(node), border_style="green" if node.round and node.round.replace_with_ramax else "cyan", padding=(1, 1)))
 
     def _handle_command_selection(self, round_index: int, target: CommandTarget | None) -> None:
         if target is None:

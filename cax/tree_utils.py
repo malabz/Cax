@@ -157,12 +157,14 @@ def _attach_rounds(node: AlignmentNode, round_map: dict[str, Round]) -> None:
 
 
 def _attach_orphans_to_root(root: AlignmentNode, round_map: dict[str, Round]) -> None:
-    """Attach a single unmatched round to an unnamed root so it can be toggled in the UI.
+    """Bind cactus-generated ancestor rounds back to unnamed internal Newick nodes.
 
-    Some cactus-prepare outputs leave the outermost Newick node unnamed, while the last
-    round (e.g. Anc0) targets that implied root. If exactly one round remains unattached
-    and the parsed root currently lacks a round, bind it there to keep ancestor/descendant
-    logic intact.
+    cactus-prepare names unnamed internal nodes as ``AncN`` in reverse postorder:
+    the outermost unnamed root is ``Anc0``, then earlier unnamed internal nodes
+    receive increasing suffixes.  The input seqfile can still contain the unnamed
+    tree, so rebuild that mapping when all unmatched rounds can be placed without
+    ambiguity.  If the names do not describe the parsed topology, keep those rounds
+    visible as explicit synthetic nodes rather than silently dropping them.
     """
 
     attached_roots: set[str] = set()
@@ -175,16 +177,42 @@ def _attach_orphans_to_root(root: AlignmentNode, round_map: dict[str, Round]) ->
 
     _collect(root)
     unmatched = [rnd for rnd in round_map.values() if rnd.root not in attached_roots]
-    if len(unmatched) == 1 and root.round is None and (not root.name):
-        root.round = unmatched.pop()
+    if not unmatched:
+        return
 
-    if unmatched:
-        existing_names = {child.name for child in root.children if child.name}
-        for rnd in unmatched:
-            if rnd.root in existing_names:
-                continue
-            child = AlignmentNode(name=rnd.root, children=[], round=rnd, parent=root)
-            root.children.append(child)
+    unnamed_internal: list[AlignmentNode] = []
+
+    def _collect_unnamed_internal(node: AlignmentNode) -> None:
+        for child in node.children:
+            _collect_unnamed_internal(child)
+        if node.children and not node.name and node.round is None:
+            unnamed_internal.append(node)
+
+    _collect_unnamed_internal(root)
+    synthetic_names = {
+        f"Anc{len(unnamed_internal) - index - 1}": node
+        for index, node in enumerate(unnamed_internal)
+    }
+
+    mapped_nodes = [(rnd, synthetic_names.get(rnd.root)) for rnd in unmatched]
+    if all(node is not None and node.round is None for _, node in mapped_nodes):
+        for rnd, node in mapped_nodes:
+            assert node is not None
+            node.round = rnd
+        return
+
+    if len(unmatched) == 1 and len(unnamed_internal) == 1:
+        node = unnamed_internal[0]
+        if node.round is None:
+            node.round = unmatched[0]
+            return
+
+    existing_names = {child.name for child in root.children if child.name}
+    for rnd in unmatched:
+        if rnd.root in existing_names:
+            continue
+        child = AlignmentNode(name=rnd.root, children=[], round=rnd, parent=root)
+        root.children.append(child)
 
 
 class _NewickParser:
