@@ -20,8 +20,9 @@ bash cactus-install.sh
 bash cactus-install.sh /path/to/cactus-bin-v3.2.1.tar.gz
 
 # install ramax
-conda install -c malab ramax
-
+conda install -c conda-forge -c malab ramax
+# install mash
+conda install -c bioconda mash
 # install cax
 pip install -e .
 ```
