@@ -64,6 +64,17 @@ def build_execution_plan(
         if replacement:
             commands.append(replacement)
             continue
+        rewritten = _prune_covered_halmerge_inputs(step, plan, tree, base_dir)
+        if rewritten:
+            commands.append(
+                _from_step(
+                    rewritten,
+                    category="halmerge",
+                    base_dir=base_dir,
+                    thread_count=thread_count,
+                )
+            )
+            continue
         if _skip_halmerge_for_ramax_parent(step, tree):
             continue
         commands.append(
@@ -346,6 +357,87 @@ def _ramax_halmerge_replacement(
         round_name=source_round.name,
         step=copy_step,
     )
+
+
+def _prune_covered_halmerge_inputs(
+    step: Step,
+    plan: Plan,
+    tree: Optional[tree_utils.AlignmentTree],
+    base_dir: Path,
+) -> Step | None:
+    if tree is None:
+        return None
+
+    command = _split_command(step.raw)
+    hal_indices = [
+        index
+        for index, token in enumerate(command)
+        if token.endswith(".hal")
+    ]
+    if len(hal_indices) < 3:
+        return None
+
+    input_hal_indices = hal_indices[:-1]
+    input_hals = [command[index] for index in input_hal_indices]
+    remove_indices: set[int] = set()
+    for index in input_hal_indices[1:]:
+        hal_path = command[index]
+        if _is_hal_covered_by_ramax_input(hal_path, input_hals, plan, tree, base_dir):
+            remove_indices.add(index)
+
+    if not remove_indices:
+        return None
+
+    rewritten_command = [
+        token
+        for index, token in enumerate(command)
+        if index not in remove_indices
+    ]
+    rewritten_out_files = [
+        command[index]
+        for index in hal_indices
+        if index not in remove_indices
+    ]
+    return Step(
+        raw=shlex.join(rewritten_command),
+        kind=step.kind,
+        jobstore=step.jobstore,
+        out_files=rewritten_out_files,
+        root=step.root,
+        log_file=step.log_file,
+        label=step.label,
+    )
+
+
+def _is_hal_covered_by_ramax_input(
+    hal_path: str,
+    input_hals: list[str],
+    plan: Plan,
+    tree: tree_utils.AlignmentTree,
+    base_dir: Path,
+) -> bool:
+    round_entry = _round_for_hal(plan, hal_path, base_dir)
+    if round_entry is None:
+        return False
+    if not (
+        _is_descendant_ramax(round_entry, tree)
+        or _is_absorbed_by_subtree_ramax(round_entry, tree)
+    ):
+        return False
+
+    node = tree.find(round_entry.root)
+    if node is None:
+        return False
+    ancestor = node.parent
+    while ancestor:
+        if ancestor.round and ancestor.round.replace_with_ramax:
+            if any(
+                _same_path(ancestor.round.target_hal, input_hal, base_dir)
+                for input_hal in input_hals
+            ):
+                return True
+        ancestor = ancestor.parent
+    return False
 
 
 def _round_for_hal(plan: Plan, hal_path: str, base_dir: Path) -> Round | None:
