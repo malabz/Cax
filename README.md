@@ -9,21 +9,18 @@ We recommend creating a fresh Conda environment and installing the project in ed
 ```bash
 conda create -n cax python=3.10 -y
 conda activate cax
+
 # Run the cactus installation script, or install cactus yourself.
 bash cactus-install.sh
 # install ramax
 conda install -c malab ramax
+
 # install cax
 pip install -e .
-```
-
-Alternatively, you can build a wheel and install it in a different environment:
-
-```bash
+# Alternatively, you can build a wheel and install it in a different environment:
 python -m build
 pip install dist/cactus_ramax-*.whl
 ```
-
 ## Quick start
 
 ### 1. Launch the interactive UI
