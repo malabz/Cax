@@ -17,10 +17,15 @@ conda install -c malab ramax
 
 # install cax
 pip install -e .
-# Alternatively, you can build a wheel and install it in a different environment:
+```
+
+Alternatively, you can build a wheel and install it in a different environment:
+
+```bash
 python -m build
 pip install dist/cactus_ramax-*.whl
 ```
+
 ## Quick start
 
 ### 1. Launch the interactive UI
