@@ -231,15 +231,19 @@ def _parse_line_to_step(
     tokens = _safe_split(stripped)
     if not tokens:
         return None
-    kind = _classify_kind(tokens[0], default_kind)
+    command_tokens, shell_log_file = _strip_trailing_tee_logging(tokens)
+    if not command_tokens:
+        return None
+    kind = _classify_kind(command_tokens[0], default_kind)
     if expected_kind and kind != expected_kind:
         kind = expected_kind
-    jobstore = _extract_jobstore(tokens)
-    root = _extract_root(tokens, kind)
-    log_file = _extract_log_file(tokens)
-    out_files = _extract_outputs(tokens, kind)
+    jobstore = _extract_jobstore(command_tokens)
+    root = _extract_root(command_tokens, kind)
+    log_file = _extract_log_file(command_tokens) or shell_log_file
+    out_files = _extract_outputs(command_tokens, kind)
+    raw = shlex.join(command_tokens) if command_tokens != tokens else stripped
     return Step(
-        raw=stripped,
+        raw=raw,
         kind=kind,
         jobstore=jobstore,
         out_files=out_files,
@@ -253,6 +257,34 @@ def _safe_split(command: str) -> List[str]:
         return shlex.split(command)
     except ValueError as exc:
         raise ParseError(f"Cannot parse command: {command}\n{exc}") from exc
+
+
+def _strip_trailing_tee_logging(tokens: list[str]) -> tuple[list[str], Optional[str]]:
+    """Remove cactus-prepare's shell-level ``tee`` logging suffix.
+    CAX executes commands with ``shell=False`` and already captures stderr into
+    the step log, so that suffix must be treated as logging metadata instead of
+    executable argv.
+    """
+
+    for pipe_token in ("|", "|&"):
+        pipe_indices = [idx for idx, token in enumerate(tokens) if token == pipe_token]
+        for pipe_index in reversed(pipe_indices):
+            tee_tokens = tokens[pipe_index + 1 :]
+            if len(tee_tokens) != 2 or tee_tokens[0] != "tee":
+                continue
+
+            command_end = pipe_index
+            if (
+                pipe_token == "|"
+                and command_end > 0
+                and tokens[command_end - 1] == "2>&1"
+            ):
+                command_end -= 1
+            if command_end == 0:
+                continue
+            return tokens[:command_end], tee_tokens[1]
+
+    return tokens, None
 
 
 def _classify_kind(first_token: str, default_kind: Optional[str]) -> str:

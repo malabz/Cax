@@ -60,6 +60,10 @@ def build_execution_plan(
         commands.extend(_round_commands(plan, round_entry, base_dir, thread_count))
 
     for step in plan.hal_merges:
+        replacement = _ramax_halmerge_replacement(step, plan, base_dir)
+        if replacement:
+            commands.append(replacement)
+            continue
         if _skip_halmerge_for_ramax_parent(step, tree):
             continue
         commands.append(
@@ -306,6 +310,55 @@ def _has_flag(command: List[str], flag: str) -> bool:
         if token.startswith(flag + "="):
             return True
     return False
+
+
+def _ramax_halmerge_replacement(
+    step: Step,
+    plan: Plan,
+    base_dir: Path,
+) -> PlannedCommand | None:
+    hal_paths = [path for path in step.out_files if path.endswith(".hal")]
+    if len(hal_paths) < 2:
+        return None
+
+    source_hal = hal_paths[0]
+    final_hal = hal_paths[-1]
+    source_round = _round_for_hal(plan, source_hal, base_dir)
+    if source_round is None or not source_round.replace_with_ramax:
+        return None
+    if _same_path(source_hal, final_hal, base_dir):
+        return None
+
+    command = ["cp", source_hal, final_hal]
+    log_path = Path(step.log_file) if step.log_file else None
+    copy_step = Step(
+        raw=shlex.join(command),
+        kind="halmerge",
+        out_files=[final_hal],
+        root=source_round.root,
+        log_file=step.log_file,
+    )
+    return PlannedCommand(
+        command=command,
+        category="halmerge",
+        display_name=f"halmerge-{source_round.root}",
+        log_path=_resolve_path(log_path, base_dir) if log_path else None,
+        round_name=source_round.name,
+        step=copy_step,
+    )
+
+
+def _round_for_hal(plan: Plan, hal_path: str, base_dir: Path) -> Round | None:
+    for round_entry in plan.rounds:
+        if _same_path(round_entry.target_hal, hal_path, base_dir):
+            return round_entry
+    return None
+
+
+def _same_path(left: str, right: str, base_dir: Path) -> bool:
+    if left == right:
+        return True
+    return _resolve_path(Path(left), base_dir) == _resolve_path(Path(right), base_dir)
 
 
 def _is_descendant_ramax(round_entry: Round, tree: Optional[tree_utils.AlignmentTree]) -> bool:
