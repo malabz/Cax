@@ -42,6 +42,13 @@ Run this first to verify the installation:
 cax auto --seqfile examples/evolverPrimates.txt --mash-threshold 0.02
 ```
 
+CAX replaced 2 of 3 Cactus alignment tasks with RaMAx in this example. In our test, runtime dropped from 14 min 33.09 sec to 6 min 13.18 sec, and peak memory dropped from 279.1 MB to 203.7 MB.
+
+| Run | Time | Maximum resident set size |
+| --- | ---: | ---: |
+| Pure Cactus | 14 min 33.09 sec | 279.1 MB |
+| CAX with RaMAx | 6 min 13.18 sec | 203.7 MB |
+
 ## Run Without UI
 
 `cax auto` skips the UI and executes the plan immediately. Auto mode **requires Mash** (it will exit if `mash` is missing).
