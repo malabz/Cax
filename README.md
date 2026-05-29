@@ -10,8 +10,15 @@ We recommend creating a fresh Conda environment and installing the project in ed
 conda create -n cax python=3.10 -y
 conda activate cax
 
-# Run the cactus installation script, or install cactus yourself.
+# Install the recommended stable Cactus release, v3.2.1.
+# You can request another Cactus version, but v3.2.1 is recommended. Other
+# versions may introduce compatibility issues with this workflow.
 bash cactus-install.sh
+
+# Or, if GitHub downloads are slow, download the Cactus tarball yourself and
+# pass the local path.
+bash cactus-install.sh /path/to/cactus-bin-v3.2.1.tar.gz
+
 # install ramax
 conda install -c malab ramax
 

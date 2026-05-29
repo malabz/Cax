@@ -4,6 +4,7 @@ set -Eeuo pipefail
 REPO="ComparativeGenomicsToolkit/cactus"
 GITHUB_HOST="https://github.com"
 SCRIPT_NAME="$(basename "$0")"
+DEFAULT_CACTUS_VERSION="v3.2.1"
 
 # Default: keep downloads and installation under the current directory.
 DOWNLOAD_DIR="${CACTUS_DOWNLOAD_DIR:-$PWD}"
@@ -14,19 +15,25 @@ INSTALL_ROOT="${CACTUS_INSTALL_ROOT:-$PWD}"
 #   CACTUS_LEGACY=1          Force the legacy build.
 #   CACTUS_LEGACY=0          Force the regular build.
 #   CACTUS_LEGACY=auto       Default: use legacy automatically when AVX2 is unavailable.
+#   CACTUS_TARBALL=/path     Use a pre-downloaded Cactus tarball.
 VERSION_OVERRIDE="${CACTUS_VERSION:-}"
 LEGACY_MODE="${CACTUS_LEGACY:-auto}"
+LOCAL_TARBALL="${CACTUS_TARBALL:-}"
 
 usage() {
   cat <<EOF
 Usage:
   ${SCRIPT_NAME} [options]
+  ${SCRIPT_NAME} /path/to/cactus-bin-vX.Y.Z.tar.gz
 
 Install the official Cactus binary release into the currently active Conda
-environment. By default, this script detects the latest GitHub release,
-downloads or reuses the matching tarball, installs the Cactus Python package
-and Toil dependencies, writes Conda activate/deactivate hooks, and verifies the
-installation with cactus -h.
+environment. By default, this script downloads or reuses the recommended
+Cactus release (${DEFAULT_CACTUS_VERSION}), installs the Cactus Python package
+and Toil dependencies, writes Conda activate/deactivate hooks, and verifies
+the installation with cactus -h.
+
+If downloading from GitHub is slow, pass a local tarball path. The local tarball
+does not need to match the recommended Cactus release.
 
 Before running:
   conda activate cax
@@ -38,8 +45,8 @@ Options:
 
 Environment variables:
   CACTUS_VERSION=v3.2.1
-      Pin a specific version. Both v3.2.1 and 3.2.1 are accepted. If unset,
-      the latest release is used.
+      Select a specific version. Both v3.2.1 and 3.2.1 are accepted. If unset,
+      ${DEFAULT_CACTUS_VERSION} is used.
 
   CACTUS_LEGACY=auto|1|0
       Select the legacy binary package. Default is auto: on x86_64, use the
@@ -52,9 +59,15 @@ Environment variables:
   CACTUS_INSTALL_ROOT=/path/to/install-root
       Directory where Cactus is extracted. Default is the current directory.
 
+  CACTUS_TARBALL=/path/to/cactus-bin-vX.Y.Z.tar.gz
+      Use a pre-downloaded Cactus tarball instead of querying/downloading from
+      GitHub.
+
 Examples:
   ./${SCRIPT_NAME}
+  ./${SCRIPT_NAME} /path/to/cactus-bin-v3.2.1.tar.gz
   CACTUS_VERSION=v3.2.1 ./${SCRIPT_NAME}
+  CACTUS_TARBALL=/path/to/cactus-bin-v3.2.1.tar.gz ./${SCRIPT_NAME}
   CACTUS_LEGACY=1 CACTUS_INSTALL_ROOT="\$HOME/opt" ./${SCRIPT_NAME}
 EOF
 }
@@ -81,9 +94,16 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-if [[ "$#" -gt 0 ]]; then
+if [[ "$#" -gt 1 ]]; then
   usage >&2
   die "Unknown argument(s): $*"
+fi
+
+if [[ "$#" -eq 1 ]]; then
+  if [[ -n "$LOCAL_TARBALL" ]]; then
+    die "Provide the local tarball either as an argument or via CACTUS_TARBALL, not both."
+  fi
+  LOCAL_TARBALL="$1"
 fi
 
 step "Checking runtime environment"
@@ -91,12 +111,18 @@ step "Checking runtime environment"
 [[ -n "${CONDA_PREFIX:-}" ]] || die "Please activate a Conda environment first, for example: conda activate cax"
 
 log "Conda env: ${CONDA_PREFIX}"
-need_cmd curl
+if [[ -z "$LOCAL_TARBALL" ]]; then
+  need_cmd curl
+fi
 need_cmd tar
 need_cmd grep
 need_cmd sed
 need_cmd python
-log "Required commands found: curl, tar, grep, sed, python"
+if [[ -n "$LOCAL_TARBALL" ]]; then
+  log "Required commands found: tar, grep, sed, python"
+else
+  log "Required commands found: curl, tar, grep, sed, python"
+fi
 
 python - <<'PY' || die "The active Conda environment must use Python >= 3.10"
 import sys
@@ -107,68 +133,66 @@ log "Python version check passed: $(python --version)"
 python -m pip --version >/dev/null 2>&1 || die "pip is missing in the active Conda environment. Run: conda install pip"
 log "pip check passed: $(python -m pip --version)"
 
-get_latest_tag() {
-  local final_url tag
-
-  final_url="$(
-    curl -fsSLI \
-      -A "cactus-conda-installer" \
-      -o /dev/null \
-      -w '%{url_effective}' \
-      "${GITHUB_HOST}/${REPO}/releases/latest"
-  )"
-
-  tag="${final_url##*/}"
-
-  [[ "$tag" =~ ^v[0-9]+(\.[0-9]+)* ]] || die "Could not parse latest release tag: $tag"
-  printf '%s\n' "$tag"
-}
-
-if [[ -n "$VERSION_OVERRIDE" ]]; then
-  step "Using user-specified Cactus version"
-  if [[ "$VERSION_OVERRIDE" == v* ]]; then
-    TAG="$VERSION_OVERRIDE"
+if [[ -n "$LOCAL_TARBALL" ]]; then
+  step "Using local Cactus tarball"
+  [[ -f "$LOCAL_TARBALL" ]] || die "Local tarball not found: $LOCAL_TARBALL"
+  TARBALL_PATH="$LOCAL_TARBALL"
+  TARBALL="$(basename "$TARBALL_PATH")"
+  if [[ "$TARBALL" =~ (v[0-9]+(\.[0-9]+)*) ]]; then
+    TAG="${BASH_REMATCH[1]}"
   else
-    TAG="v${VERSION_OVERRIDE}"
+    TAG="local"
   fi
+  URL="not used"
+  log "Local tarball: ${TARBALL_PATH}"
+  log "Version inferred from tarball: ${TAG}"
 else
-  step "Querying the latest Cactus release from GitHub"
-  TAG="$(get_latest_tag)"
-fi
-log "Version to install: ${TAG}"
-
-step "Selecting binary package type"
-case "$LEGACY_MODE" in
-  auto)
-    USE_LEGACY=0
-    if [[ "$(uname -m)" == "x86_64" ]] && ! grep -qw avx2 /proc/cpuinfo 2>/dev/null; then
-      USE_LEGACY=1
+  if [[ -n "$VERSION_OVERRIDE" ]]; then
+    step "Using user-specified Cactus version"
+    if [[ "$VERSION_OVERRIDE" == v* ]]; then
+      TAG="$VERSION_OVERRIDE"
+    else
+      TAG="v${VERSION_OVERRIDE}"
     fi
-    ;;
-  1|true|TRUE|yes|YES|y|Y)
-    USE_LEGACY=1
-    ;;
-  0|false|FALSE|no|NO|n|N)
-    USE_LEGACY=0
-    ;;
-  *)
-    die "CACTUS_LEGACY must be auto, 1, or 0"
-    ;;
-esac
+  else
+    step "Using default recommended Cactus version"
+    TAG="$DEFAULT_CACTUS_VERSION"
+  fi
+  log "Version to install: ${TAG}"
 
-if [[ "$USE_LEGACY" -eq 1 ]]; then
-  TARBALL="cactus-bin-legacy-${TAG}.tar.gz"
-else
-  TARBALL="cactus-bin-${TAG}.tar.gz"
-fi
-if [[ "$USE_LEGACY" -eq 1 ]]; then
-  log "Selected legacy package: ${TARBALL}"
-else
-  log "Selected regular package: ${TARBALL}"
-fi
+  step "Selecting binary package type"
+  case "$LEGACY_MODE" in
+    auto)
+      USE_LEGACY=0
+      if [[ "$(uname -m)" == "x86_64" ]] && ! grep -qw avx2 /proc/cpuinfo 2>/dev/null; then
+        USE_LEGACY=1
+      fi
+      ;;
+    1|true|TRUE|yes|YES|y|Y)
+      USE_LEGACY=1
+      ;;
+    0|false|FALSE|no|NO|n|N)
+      USE_LEGACY=0
+      ;;
+    *)
+      die "CACTUS_LEGACY must be auto, 1, or 0"
+      ;;
+  esac
 
-URL="${GITHUB_HOST}/${REPO}/releases/download/${TAG}/${TARBALL}"
-TARBALL_PATH="${DOWNLOAD_DIR}/${TARBALL}"
+  if [[ "$USE_LEGACY" -eq 1 ]]; then
+    TARBALL="cactus-bin-legacy-${TAG}.tar.gz"
+  else
+    TARBALL="cactus-bin-${TAG}.tar.gz"
+  fi
+  if [[ "$USE_LEGACY" -eq 1 ]]; then
+    log "Selected legacy package: ${TARBALL}"
+  else
+    log "Selected regular package: ${TARBALL}"
+  fi
+
+  URL="${GITHUB_HOST}/${REPO}/releases/download/${TAG}/${TARBALL}"
+  TARBALL_PATH="${DOWNLOAD_DIR}/${TARBALL}"
+fi
 
 step "Installation settings"
 log "Conda env     : ${CONDA_PREFIX}"
@@ -226,7 +250,13 @@ download_tarball() {
   log "tarball integrity check passed."
 }
 
-download_tarball
+if [[ -n "$LOCAL_TARBALL" ]]; then
+  step "Validating local Cactus tarball"
+  tar -tzf "$TARBALL_PATH" >/dev/null 2>&1 || die "Local tarball is invalid: ${TARBALL_PATH}"
+  log "Local tarball integrity check passed."
+else
+  download_tarball
+fi
 
 step "Detecting tarball top-level directory"
 TOPDIR="$(
