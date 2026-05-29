@@ -2,7 +2,7 @@
 
 Cactus-RaMAx helps you remix alignment plans emitted by `cactus-prepare`. You can inspect every round, toggle RaMAx for any subtree, and then run or export the resulting command list. The current version (`0.6.1`) keeps the ASCII phylogenetic canvas with subtree/single-node toggle scopes, search, proportional branch spacing, and a bottom HUD that summarizes the current node, coverage, and live system metrics. Subtree Mode is a CAX-only toggle that disables descendant RaMAx automatically and gracefully reverts if you later edit a child node.
 
-## Environment setup
+## Installation
 
 We recommend creating a fresh Conda environment and installing the project in editable mode:
 
@@ -34,9 +34,42 @@ python -m build
 pip install dist/cactus_ramax-*.whl
 ```
 
-## Quick start
+## Quick Start: Run the Primate Example
 
-### 1. Launch the interactive UI
+Run this first to verify the installation:
+
+```bash
+cax auto --seqfile examples/evolverPrimates.txt --mash-threshold 0.02
+```
+
+## Run Without UI
+
+`cax auto` skips the UI and executes the plan immediately. Auto mode **requires Mash** (it will exit if `mash` is missing).
+
+**Recommended short form (seqfile + threshold):**
+
+```bash
+cax auto --seqfile examples/evolverPrimates.txt --mash-threshold 0.02
+```
+
+This auto-generates output paths using the seqfile stem:
+`~/.cax/outputs/<stem>/<stem>.txt` (outSeqFile), `<stem>.hal` (outHal), and `jobstore` (jobStore).
+
+**Full control (optional):**
+
+```bash
+cax auto --prepare-args "examples/evolverMammals.txt --outDir steps-output --outSeqFile ... --outHal ... --jobStore jobstore"
+```
+
+Or parse an existing prepare output:
+
+```bash
+cax auto --from-file steps-output/prepare_output.txt
+```
+
+Use `--no-ask-mash` to skip the Mash confirmation prompt. Use `--cache-seqs` to download remote URLs before Mash computation.
+
+## Run With UI
 
 Run the entry point directly:
 
@@ -67,35 +100,6 @@ cax
 - If your inputs reference remote URLs (either directly in `--outSeqFile` or via the `cactus-preprocess` input seq file, as in the bundled Evolver examples), pass `--cache-seqs` to download them into a local cache and rewrite the plan to use the cached files. This avoids repeated downloads during cactus execution and enables Mash auto-selection to run on local inputs.
   - When Mash auto-selection is enabled (default), CAX will prompt you to cache remote URLs automatically before the UI opens.
 
-### 1b. Run without UI (auto mode)
-
-`cax auto` skips the UI and executes the plan immediately. Auto mode **requires Mash** (it will exit if `mash` is missing).
-
-**Recommended short form (seqfile + threshold):**
-
-```bash
-cax auto --seqfile examples/evolverMammals.txt --mash-threshold 0.02
-```
-
-This auto-generates output paths using the seqfile stem:
-`~/.cax/outputs/<stem>/<stem>.txt` (outSeqFile), `<stem>.hal` (outHal), and `jobstore` (jobStore).
-
-**Full control (optional):**
-
-```bash
-cax auto --prepare-args "examples/evolverMammals.txt --outDir steps-output --outSeqFile ... --outHal ... --jobStore jobstore"
-```
-
-Or parse an existing prepare output:
-
-```bash
-cax auto --from-file steps-output/prepare_output.txt
-```
-
-Use `--no-ask-mash` to skip the Mash confirmation prompt. Use `--cache-seqs` to download remote URLs before Mash computation.
-
-### 2. Work inside the UI
-
 - The left pane renders an ASCII phylogenetic canvas with proportional branch spacing; use arrow keys or **h/j/k/l** to move, press **Space** to toggle RaMAx using the current scope, and press **b** to switch the scope between subtree and single node. Press **/** to search node names, then **n** / **Shift+N** to cycle through matches.
 - The canvas paints cactus vs. RaMAx states inline, annotates branch lengths on dotted leaders, and shows a bottom HUD with identity, subtree/total RaMAx coverage, and live CPU/GPU/memory/disk metrics. Press **i** for a full detail modal of the current node.
 - The right-hand detail pane shows the selected round's Mash distance (when available) and explains whether it is a subtree max (all pairs checked) or a witness (early-stop). Press `T` to adjust the threshold and recompute / reselect automatically when Mash is enabled.
@@ -106,7 +110,7 @@ Use `--no-ask-mash` to skip the Mash confirmation prompt. Use `--cache-seqs` to 
 
 When RaMAx is enabled for a round or subtree, execution stops on the first failure—it does not fall back to cactus `blast`/`align` automatically.
 
-### 3. Templates and history (optional)
+## Templates and history
 
 - Built-in templates are sourced from the packaged Evolver mammals/primates examples and any `.txt` files you add under `examples/`; user-defined templates live in `~/.cax/templates.json`.
 - Command history is stored at `~/.cax/history.json`. It deduplicates consecutive runs, keeps up to 20 entries, and syncs with the Textual prompt so you can reuse or delete past commands.
