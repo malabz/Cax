@@ -7,6 +7,9 @@ Cactus-RaMAx helps you remix alignment plans emitted by `cactus-prepare`. You ca
 We recommend creating a fresh Conda environment and installing the project in editable mode:
 
 ```bash
+git clone https://github.com/malabz/Cax.git
+cd Cax
+
 conda create -n cax python=3.10 -y
 conda activate cax
 
