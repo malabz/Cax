@@ -13,6 +13,7 @@ We recommend creating a fresh Conda environment and installing the project in ed
 git clone https://github.com/malabz/Cax.git
 cd Cax
 
+# create conda enviroment
 conda create -n cax python=3.10 -y
 conda activate cax
 
