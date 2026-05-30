@@ -123,11 +123,11 @@ function Navbar() {
 const heroCli = `# 解析 Cactus 规划拓扑
 $ cax --from-file prepare_output.txt
 
-# 基于 Mash 遗传距离自动优化对齐策略
-$ cax --mash-threshold 0.02 --threads 32
+# 一条命令自动缓存、筛选并执行
+$ cax auto --seqfile examples/evolverPrimates.txt --mash-threshold 0.02
 
-# 导出混合比对执行脚本
-$ cax --export ramax_commands.txt`;
+# 打开交互式树界面
+$ cax`;
 
 function Hero() {
   const c1 = useCounter(metrics.maxCladeSpeedup, 1);
@@ -229,30 +229,7 @@ function About() {
   );
 }
 
-/* ━━━━━━━━━━━━━ TERMINAL DEMO ━━━━━━━━━━━━━ */
-type DemoNode = {
-  name: string;
-  indent: string;
-  tag: string;
-  tagType: "root" | "ramax" | "cactus" | "leaf" | "merge";
-  detail: string;
-};
-
-const demoNodes: DemoNode[] = [
-  { name: "Anc0", indent: "", tag: "Root", tagType: "root", detail: "系统发育树根节点 — 保留 Cactus 以维持宏观共线性" },
-  { name: "Anc1", indent: "├── ", tag: "RaMAx", tagType: "ramax", detail: "高同源子树 — Mash dist=0.014, 自动部署 RaMAx (18×)" },
-  { name: "simCow_chr6", indent: "│   ├── ", tag: "leaf", tagType: "leaf", detail: "牛基因组 · chr6 输入序列" },
-  { name: "simDog_chr6", indent: "│   └── ", tag: "leaf", tagType: "leaf", detail: "犬基因组 · chr6 输入序列" },
-  { name: "Anc2", indent: "├── ", tag: "Cactus", tagType: "cactus", detail: "远缘分支 — 保留 Cactus 处理跨物种大片段重排" },
-  { name: "simHuman_chr6", indent: "│   ├── ", tag: "leaf", tagType: "leaf", detail: "人类基因组 · chr6 (含 MHC 区域)" },
-  { name: "mr", indent: "│   └── ", tag: "Cactus", tagType: "cactus", detail: "鼠科祖先 — 基因组漂移快, 需精细重建" },
-  { name: "simMouse_chr6", indent: "│       ├── ", tag: "leaf", tagType: "leaf", detail: "小鼠基因组 · chr6" },
-  { name: "simRat_chr6", indent: "│       └── ", tag: "leaf", tagType: "leaf", detail: "大鼠基因组 · chr6" },
-  { name: "halAppendSubtrees", indent: "└── ", tag: "merge", tagType: "merge", detail: "子树自动拼接 → 全局 HAL 多向比对数据库" },
-];
-
 function TerminalDemo() {
-  const [selected, setSelected] = useState(1);
   const r = useReveal<HTMLDivElement>();
 
   return (
@@ -261,54 +238,29 @@ function TerminalDemo() {
         <div className="section-header">
           <span className="section-label">Interactive Console</span>
           <h2>树感知规划界面</h2>
-          <p>CAX 将复杂的系统发育依赖关系还原为可交互的分支画布，点击任意节点查看对齐策略。</p>
+          <p>CAX 将复杂的系统发育依赖关系还原为可交互的分支画布，直接在终端中审查、替换并运行混合比对计划。</p>
         </div>
-        <div className="terminal-demo">
-          <div className="terminal-titlebar">
-            <div className="terminal-dots">
-              <span className="terminal-dot red" />
-              <span className="terminal-dot yellow" />
-              <span className="terminal-dot green" />
-            </div>
-            <span className="terminal-title">cax --from-file prepare_output.txt</span>
+        <div className="ui-demo-panel">
+          <div className="ui-demo-media">
+            <img
+              src={`${import.meta.env.BASE_URL}cax-ui-demo.gif`}
+              alt="CAX interactive terminal UI showing tree navigation, RaMAx toggles, run settings, and command execution"
+              loading="lazy"
+            />
           </div>
-          <div className="terminal-body">
-            <div className="terminal-tree">
-              {demoNodes.map((node, i) => (
-                <div
-                  key={node.name}
-                  className={`terminal-tree-node${selected === i ? " selected" : ""}`}
-                  onClick={() => setSelected(i)}
-                  style={{ cursor: "pointer" }}
-                >
-                  <span className="tree-branch">{node.indent}</span>
-                  <span className={node.tagType === "ramax" || node.tagType === "merge" ? "tree-highlight" : node.tagType === "cactus" || node.tagType === "root" ? "tree-dir" : "tree-file"}>
-                    {node.name}
-                  </span>
-                  {" "}
-                  <span style={{ color: node.tagType === "ramax" ? "var(--accent)" : node.tagType === "cactus" ? "#f85149" : node.tagType === "merge" ? "#79c0ff" : "var(--text-tertiary)", fontSize: "0.75rem" }}>
-                    [{node.tag}]
-                  </span>
-                </div>
-              ))}
+          <div className="ui-demo-notes">
+            <div>
+              <strong>Tree canvas</strong>
+              <span>用真实拓扑展示 Cactus / RaMAx 状态，避免在未命名祖先节点上丢失上下文。</span>
             </div>
-            <div className="terminal-hud">
-              <span className="terminal-hud-key">节点</span>
-              <span className="terminal-hud-value">{demoNodes[selected].name}</span>
-              <span className="terminal-hud-key">策略</span>
-              <span className={`terminal-hud-value${demoNodes[selected].tagType === "ramax" ? " accent" : demoNodes[selected].tagType === "cactus" ? " warn" : ""}`}>
-                {demoNodes[selected].tag}
-              </span>
-              <span className="terminal-hud-key">详情</span>
-              <span className="terminal-hud-value">{demoNodes[selected].detail}</span>
+            <div>
+              <strong>Run settings</strong>
+              <span>统一设置线程、日志与执行模式，运行前可复查完整依赖树。</span>
             </div>
-            <span className="terminal-cursor" />
-          </div>
-          <div className="terminal-statusbar">
-            <span>Rounds: 4/4</span>
-            <span>替换: 2 分支</span>
-            <span>预估加速: {fmt(metrics.maxCladeSpeedup, 1)}×</span>
-            <span className="status-ok">● Ready</span>
+            <div>
+              <strong>Execution view</strong>
+              <span>命令启动后持续显示当前步骤、剩余任务与资源状态。</span>
+            </div>
           </div>
         </div>
       </div>
@@ -582,23 +534,23 @@ function QualitySection() {
 }
 
 /* ━━━━━━━━━━━━━ QUICK START ━━━━━━━━━━━━━ */
-const installCode = `# 安装 CAX
-pip install cactus-ramax
+const installCode = `# 推荐在干净 Conda 环境中安装
+conda create -n cax python=3.10 -y
+conda activate cax
 
-# 准备输入文件
-cat seqFile.txt          # 基因组路径列表
-cat tree.nwk             # 系统发育引导树 (Newick 格式)
+# 一键安装推荐 Cactus 版本
+bash cactus-install.sh
 
-# 运行 CAX 规划器
-cax --from-file prepare_output.txt \\
-    --mash-threshold 0.02 \\
-    --threads 32 \\
-    --export ramax_commands.txt
+# 安装 RaMAx、Mash 与 CAX
+conda install -c conda-forge -c malab ramax
+conda install -c bioconda mash
+pip install -e .`;
 
-# 执行混合比对
-bash ramax_commands.txt
+const runCode = `# 自动生成输出路径并直接运行
+cax auto --seqfile examples/evolverPrimates.txt --mash-threshold 0.02
 
-# 输出: output.hal (全局多向比对数据库)`;
+# 或打开交互式 UI
+cax`;
 
 function QuickStart() {
   const r = useReveal<HTMLDivElement>();
@@ -610,9 +562,21 @@ function QuickStart() {
           <h2>快速开始</h2>
           <p style={{ margin: "0 auto" }}>几条命令即可完成从安装到输出的完整流程。</p>
         </div>
-        <div className="quickstart-code">
-          <pre><code>{installCode}</code></pre>
-          <CopyBtn text={installCode.replace(/^#.*\n?/gm, "").trim()} />
+        <div className="quickstart-grid">
+          <div className="quickstart-card">
+            <h3>安装环境</h3>
+            <div className="quickstart-code">
+              <pre><code>{installCode}</code></pre>
+              <CopyBtn text={installCode.replace(/^#.*\n?/gm, "").trim()} />
+            </div>
+          </div>
+          <div className="quickstart-card">
+            <h3>验证运行</h3>
+            <div className="quickstart-code">
+              <pre><code>{runCode}</code></pre>
+              <CopyBtn text={runCode.replace(/^#.*\n?/gm, "").trim()} />
+            </div>
+          </div>
         </div>
       </div>
     </section>
