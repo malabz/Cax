@@ -32,7 +32,7 @@ from .runner import PlanRunner, RunnerEvent
 
 
 SUBTREE_MODE_FLAG = "--subtree-mode"
-TREE_STATUS_HELP = "E edit · R run · I details · / search · T mash · Space RaMAx · B scope · X fold/open · Q quit"
+TREE_STATUS_HELP = "Space RaMAx    T Distance    R Run     · / search"
 RUN_ITEM_STYLE = "white"
 RUN_VALUE_STYLE = "#94a3b8"
 RUN_HELP_STYLE = "italic dim #64748b"
@@ -70,6 +70,10 @@ def _node_display_name(node: tree_utils.AlignmentNode) -> str:
     if node.name:
         return node.name
     return "Root" if getattr(node, "parent", None) is None else "clade"
+
+
+def _normalize_search_text(value: str) -> str:
+    return "".join(character.lower() for character in value if character.isalnum())
 
 
 def _node_search_text(node: tree_utils.AlignmentNode) -> str:
@@ -412,53 +416,6 @@ class InfoModal(ModalScreen[None]):
         self.dismiss(None)
 
 
-class SearchModal(ModalScreen[str | None]):
-    """Single-line search input modal."""
-
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
-
-    CSS = """
-    SearchModal {
-        align: center middle;
-    }
-    #search-dialog {
-        padding: 1 2;
-        min-width: 40;
-        border: round $accent;
-        background: $panel;
-    }
-    #search-title {
-        padding-bottom: 1;
-    }
-    #search-hint {
-        padding-top: 1;
-        color: $text-muted;
-    }
-    """
-
-    def __init__(self, initial: str = ""):
-        super().__init__()
-        self.initial = initial
-        self._input: Input | None = None
-
-    def compose(self) -> ComposeResult:
-        with Container(id="search-dialog"):
-            yield Static("Enter a node keyword", id="search-title")
-            self._input = Input(value=self.initial, placeholder="e.g. human / panTro")
-            yield self._input
-            yield Static("Enter to confirm, Esc to cancel", id="search-hint")
-
-    def on_mount(self) -> None:
-        if self._input:
-            self.set_focus(self._input)
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        self.dismiss(event.value.strip())
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
-
-
 THREAD_AUTO = "auto"
 
 
@@ -586,7 +543,10 @@ class MashThresholdModal(ModalScreen[float | None]):
 
     def compose(self) -> ComposeResult:
         with Container(id="mash-dialog"):
-            yield Static("Mash distance threshold (distance ≤ threshold enables RaMAx)", id="mash-title")
+            yield Static(
+                "Genome distance threshold (computed with Mash; distance <= threshold enables RaMAx)",
+                id="mash-title",
+            )
             threshold_input = Input(
                 value=f"{self.initial:.4f}",
                 placeholder="0.02",
@@ -788,7 +748,7 @@ class PlanTreeBrowser(Static):
         Binding("down", "cursor_down", show=False),
         Binding("left", "cursor_left", show=False),
         Binding("right", "cursor_right", show=False),
-        Binding("b", "toggle_scope", "Scope"),
+        Binding("b", "toggle_scope", "Scope", show=False),
         Binding("space", "toggle_apply", "Toggle RaMAx"),
         Binding("enter", "edit_round", "Edit"),
         Binding("/", "open_search", "Search"),
@@ -808,6 +768,31 @@ class PlanTreeBrowser(Static):
         layout: vertical;
         min-height: 0;
     }
+    #tree-search-bar {
+        height: 3;
+        width: 100%;
+        layout: horizontal;
+        background: #111827;
+        padding: 0 0;
+    }
+    #tree-search-bar.hidden {
+        display: none;
+    }
+    #tree-search-label {
+        width: 9;
+        height: 3;
+        content-align: left middle;
+        color: #94a3b8;
+    }
+    #tree-search-input {
+        width: 1fr;
+    }
+    #tree-search-count {
+        width: 16;
+        height: 3;
+        content-align: right middle;
+        color: #94a3b8;
+    }
     PlanTreeBrowser > Tree {
         height: 1fr;
         width: 1fr;
@@ -821,14 +806,27 @@ class PlanTreeBrowser(Static):
         self.root_node = root
         self.scope = "subtree"
         self._tree: TextualTree[tree_utils.AlignmentNode] | None = None
+        self._search_bar: Container | None = None
+        self._search_input: Input | None = None
+        self._search_count: Static | None = None
         self._node_to_tree: dict[tree_utils.AlignmentNode, TreeNode[tree_utils.AlignmentNode]] = {}
         self._focused_node = root
         self._search_term: str | None = None
         self._hits: list[tree_utils.AlignmentNode] = []
         self._hit_index = 0
+        self._search_active = False
         self._detail_callback = _DetailCallback()
 
     def compose(self) -> ComposeResult:
+        with Container(id="tree-search-bar", classes="hidden") as search_bar:
+            self._search_bar = search_bar
+            yield Static("Search", id="tree-search-label")
+            search_input = Input(value="", placeholder="species or clade name", id="tree-search-input")
+            self._search_input = search_input
+            yield search_input
+            search_count = Static("", id="tree-search-count")
+            self._search_count = search_count
+            yield search_count
         tree = _PlanTextualTree(self._label_for(self.root_node), data=self.root_node, id="plan-tree")
         tree.show_root = True
         tree.auto_expand = False
@@ -842,6 +840,30 @@ class PlanTreeBrowser(Static):
         if self._tree:
             self._tree.focus()
             self.call_after_refresh(self._initialize_tree_view)
+
+    def on_key(self, event: events.Key) -> None:
+        if not self._search_active:
+            return
+        if event.key == "escape":
+            event.prevent_default()
+            event.stop()
+            self._close_inline_search()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input is not self._search_input:
+            return
+        event.stop()
+        self._apply_inline_search(event.value, focus_first=True)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input is not self._search_input:
+            return
+        event.prevent_default()
+        event.stop()
+        if self._hits:
+            self._jump_hit(+1)
+        else:
+            self._apply_inline_search(event.value, focus_first=True)
 
     def _initialize_tree_view(self, *, preserve_focus: bool = False) -> None:
         if not self._tree:
@@ -891,7 +913,13 @@ class PlanTreeBrowser(Static):
 
     def _label_for(self, node: tree_utils.AlignmentNode) -> Text:
         kind = self._node_kind(node)
-        marker = {"ramax": "R", "cactus": "C", "covered": "R*", "clade": "◇", "leaf": "L"}[kind]
+        marker = {
+            "ramax": "RaMAx",
+            "cactus": "Cactus",
+            "covered": "RaMAx",
+            "clade": "Clade",
+            "leaf": "Species",
+        }[kind]
         style = {
             "ramax": "bold #f59e0b",
             "covered": "bold #fbbf24",
@@ -902,8 +930,10 @@ class PlanTreeBrowser(Static):
         label = Text()
         label.append(f"{marker} ", style=style)
         label.append(_node_display_name(node), style=style)
+        if kind == "covered":
+            label.append(" inherited", style="dim #fbbf24")
         if node.round and node.round.mash_distance is not None:
-            label.append(f" mash {node.round.mash_distance:.4f}", style="dim #94a3b8")
+            label.append(f" distance {node.round.mash_distance:.4f}", style="dim #94a3b8")
         if node.round and _is_subtree_mode_round(node.round):
             label.append(" subtree", style="dim #fbbf24")
         return label
@@ -1044,30 +1074,74 @@ class PlanTreeBrowser(Static):
         return [candidate for candidate in node.walk() if candidate.round]
 
     def action_open_search(self) -> None:
-        self.app.push_screen(SearchModal(self._search_term or ""), self._apply_search_term)
+        self._open_inline_search()
 
-    def _apply_search_term(self, term: str | None) -> None:
-        if term is None:
-            return
-        cleaned = term.strip().lower()
-        if not cleaned:
+    def _open_inline_search(self) -> None:
+        self._search_active = True
+        if self._search_bar:
+            self._search_bar.remove_class("hidden")
+        if self._search_input:
+            self._search_input.value = self._search_term or ""
+            self._search_input.cursor_position = len(self._search_input.value)
+            self._search_input.focus()
+        self._update_search_count()
+        self._notify("Search: type a species or clade name. Esc closes search.")
+
+    def _close_inline_search(self) -> None:
+        self._search_active = False
+        if self._search_bar:
+            self._search_bar.add_class("hidden")
+        if self._tree:
+            self._tree.focus()
+        self._notify()
+
+    def _apply_inline_search(self, term: str, *, focus_first: bool) -> None:
+        raw = term.strip()
+        normalized = _normalize_search_text(raw)
+        if not normalized:
             self._search_term = None
             self._hits = []
-            self._notify("Search cleared.")
+            self._hit_index = 0
+            self._update_search_count("Type to search")
             return
-        self._search_term = cleaned
-        self._hits = [node for node in self.root_node.walk() if cleaned in _node_search_text(node)]
+
+        self._search_term = raw
+        raw_lower = raw.lower()
+        self._hits = [
+            node
+            for node in self.root_node.walk()
+            if raw_lower in _node_search_text(node) or normalized in _normalize_search_text(_node_search_text(node))
+        ]
         self._hit_index = 0
         if not self._hits:
-            self._notify("No matching nodes found.")
+            self._update_search_count("No match")
             return
-        self._focus_node(self._hits[0])
-        self._notify(f"Found {len(self._hits)} match(es).")
+        if focus_first:
+            self._focus_node(self._hits[0])
+        self._update_search_count()
+
+    def _update_search_count(self, message: str | None = None) -> None:
+        if not self._search_count:
+            return
+        if message is not None:
+            self._search_count.update(message)
+            return
+        if not self._search_term:
+            self._search_count.update("Type to search")
+            return
+        if not self._hits:
+            self._search_count.update("No match")
+            return
+        self._search_count.update(f"{self._hit_index + 1}/{len(self._hits)}")
 
     def action_search_next(self) -> None:
+        if self._search_active and self._search_input and self.app.focused is self._search_input:
+            return
         self._jump_hit(+1)
 
     def action_search_prev(self) -> None:
+        if self._search_active and self._search_input and self.app.focused is self._search_input:
+            return
         self._jump_hit(-1)
 
     def _jump_hit(self, delta: int) -> None:
@@ -1075,6 +1149,7 @@ class PlanTreeBrowser(Static):
             return
         self._hit_index = (self._hit_index + delta) % len(self._hits)
         self._focus_node(self._hits[self._hit_index])
+        self._update_search_count()
         self._notify(f"Match {self._hit_index + 1}/{len(self._hits)}.")
 
     def _focus_node(self, node: tree_utils.AlignmentNode) -> None:
@@ -1182,36 +1257,56 @@ class DecisionPanel(Static):
         run_settings: RunSettings,
         status: str | None,
     ) -> RenderableType:
-        header = Text("Decision", style="bold cyan")
+        header = Text("Selected", style="bold cyan")
         title = Text.assemble(("Node: ", "dim"), (_node_display_name(node), "bold white"))
-        scope_text = "Single node" if scope == "node" else "Subtree"
+        scope_text = "single node" if scope == "node" else "subtree"
         body = Table.grid(expand=True, padding=(0, 1))
         body.add_column(ratio=1)
         body.add_column(ratio=2)
-        body.add_row("Scope", Text(scope_text, style="bold yellow" if scope == "subtree" else "bold cyan"))
         if node.round:
             mode = "RaMAx" if node.round.replace_with_ramax else "Cactus"
             if _is_effective_ramax_node(node) and not node.round.replace_with_ramax:
-                mode = "RaMAx (covered by ancestor subtree)"
-            body.add_row("Decision", Text(mode, style="bold green" if "RaMAx" in mode else "bold cyan"))
+                mode = "RaMAx (inherited)"
+            is_ramax = "RaMAx" in mode
+            body.add_row(
+                "RaMAx",
+                Text("on" if is_ramax else "off", style="bold #f59e0b" if is_ramax else "bold #22d3ee"),
+            )
+            body.add_row("Mode", mode)
             body.add_row("Round", node.round.name)
             if node.round.mash_distance is not None:
                 mash = f"{node.round.mash_distance:.4f}"
                 if node.round.mash_source and node.round.mash_source != node.round.root:
                     mash += f" @ {node.round.mash_source}"
-                body.add_row("Mash", mash)
+                body.add_row("Distance", mash)
                 body.add_row("Threshold", f"{run_settings.mash_distance_threshold:.4f}")
             else:
-                body.add_row("Mash", "(not computed)")
+                body.add_row("Distance", "(not computed)")
             subtree_rounds = list(node.iter_rounds())
         else:
-            body.add_row("Decision", "No round on this node")
+            body.add_row("RaMAx", "no round on this node")
             subtree_rounds = list(node.iter_rounds())
         if subtree_rounds:
             subtree_nodes = [candidate for candidate in node.walk() if candidate.round]
             effective = sum(1 for candidate in subtree_nodes if _is_effective_ramax_node(candidate))
             body.add_row("Rounds", f"{effective}/{len(subtree_rounds)} RaMAx")
-        parts: list[RenderableType] = [header, title, Text(""), body]
+        scope_hint = Text(f"Applies to this {scope_text}", style="dim #94a3b8")
+        keys = Table.grid(expand=True, padding=(0, 1))
+        keys.add_column(ratio=1)
+        keys.add_column(ratio=2)
+        keys.add_row(Text("Space", style="bold white on #0e7490"), "toggle RaMAx")
+        keys.add_row(Text("T", style="bold white on #0e7490"), "change distance")
+        keys.add_row(Text("R", style="bold white on #0e7490"), "run")
+        parts: list[RenderableType] = [
+            header,
+            title,
+            scope_hint,
+            Text(""),
+            body,
+            Text(""),
+            Text("Primary keys", style="bold cyan"),
+            keys,
+        ]
         if status:
             parts.insert(2, Text(status, style="green"))
         return Group(*parts)
@@ -2050,7 +2145,7 @@ class PlanUIApp(App[UIResult]):
         background: rgba(0, 0, 0, 0.6);
         align: center middle;
     }
-    #picker-dialog, #editor-dialog, #info-dialog, #search-dialog, #round-picker, #options-dialog, #run-form {
+    #picker-dialog, #editor-dialog, #info-dialog, #round-picker, #options-dialog, #run-form {
         border: thick $accent;
         background: $surface;
         padding: 1 2;
@@ -2255,7 +2350,7 @@ class PlanUIApp(App[UIResult]):
         if self.run_settings.mash_auto and shutil.which("mash"):
             if self.is_running:
                 self._pending_mash_threshold = threshold
-                self._update_status_bar(f"Computing Mash distances for threshold={threshold:.4f}...")
+                self._update_status_bar(f"Computing genome distances for threshold={threshold:.4f}...")
 
                 def work() -> mash_auto_module.MashAutoSummary:
                     preprocess_seq_file = seq_cache.find_preprocess_input_seq_file(self.plan, base_dir=self.base_dir)
@@ -2270,7 +2365,7 @@ class PlanUIApp(App[UIResult]):
                     work,
                     name="mash-threshold",
                     group="mash",
-                    description="Compute Mash distances for threshold changes",
+                    description="Compute genome distances for threshold changes",
                     exit_on_error=False,
                     exclusive=True,
                     thread=True,
@@ -2285,13 +2380,13 @@ class PlanUIApp(App[UIResult]):
                 sequence_file=preprocess_seq_file,
             )
             status = (
-                f"Applied Mash threshold {threshold:.4f}: enabled {summary.enabled_ramax}/{summary.computed} rounds "
+                f"Applied distance threshold {threshold:.4f}: enabled {summary.enabled_ramax}/{summary.computed} rounds "
                 f"(pairs: +{summary.pairwise_computed}, cached {summary.pairwise_cached})."
             )
         else:
             summary = mash_auto_module.apply_mash_threshold(self.plan, threshold=threshold)
             status = (
-                f"Applied Mash threshold {threshold:.4f}: enabled {summary.enabled_ramax}/{summary.considered} rounds "
+                f"Applied distance threshold {threshold:.4f}: enabled {summary.enabled_ramax}/{summary.considered} rounds "
                 f"(changed {summary.changed})."
             )
 
@@ -2306,7 +2401,7 @@ class PlanUIApp(App[UIResult]):
             return
         if message.state == WorkerState.ERROR:
             error = message.worker.error
-            self._update_status_bar(f"Mash computation failed: {error}")
+            self._update_status_bar(f"Distance computation failed: {error}")
             return
         if message.state != WorkerState.SUCCESS:
             return
@@ -2315,7 +2410,7 @@ class PlanUIApp(App[UIResult]):
         if summary is None:
             return
         status = (
-            f"Applied Mash threshold {threshold:.4f}: enabled {summary.enabled_ramax}/{summary.computed} rounds "
+            f"Applied distance threshold {threshold:.4f}: enabled {summary.enabled_ramax}/{summary.computed} rounds "
             f"(pairs: +{summary.pairwise_computed}, cached {summary.pairwise_cached})."
         )
         if self.canvas:
@@ -2327,32 +2422,32 @@ class PlanUIApp(App[UIResult]):
     def _round_details(self, round_entry: Round) -> list[str]:
         details = [f"[bold]{round_entry.name}[/bold] root={round_entry.root}"]
         if round_entry.mash_distance is not None:
-            prefix = "Mash distance"
+            prefix = "Distance"
             if round_entry.mash_reference and round_entry.mash_query:
                 prefix = f"{prefix} ({round_entry.mash_reference} vs {round_entry.mash_query})"
             details.append(f"{prefix}: {round_entry.mash_distance:.4f}")
             threshold = self.run_settings.mash_distance_threshold
             details.append(
-                f"[dim]Mash note: distance ≤ {threshold:.4f} means subtree max (all pairs checked); "
+                f"[dim]Distance note: distance <= {threshold:.4f} means subtree max (all pairs checked); "
                 f"distance > {threshold:.4f} means a witness pair was found (early-stop).[/dim]"
             )
             if round_entry.mash_source and round_entry.mash_source != round_entry.root:
                 if round_entry.mash_distance > threshold:
                     details.append(
-                        f"[dim]Mash source: {round_entry.mash_source} (descendant witness; this node inherits the failure).[/dim]"
+                        f"[dim]Distance source: {round_entry.mash_source} (descendant witness; this node inherits the failure).[/dim]"
                     )
                 else:
                     details.append(
-                        f"[dim]Mash source: {round_entry.mash_source} (subtree max observed in descendant).[/dim]"
+                        f"[dim]Distance source: {round_entry.mash_source} (subtree max observed in descendant).[/dim]"
                     )
         elif self.run_settings.mash_auto:
             if shutil.which("mash") is None:
-                details.append("[dim]Mash distance: (not computed — `mash` not found on PATH)[/dim]")
+                details.append("[dim]Distance: (not computed - `mash` not found on PATH)[/dim]")
             else:
                 threshold = self.run_settings.mash_distance_threshold
-                details.append("[dim]Mash distance: (not computed for this round)[/dim]")
+                details.append("[dim]Distance: (not computed for this round)[/dim]")
                 details.append(
-                    f"[dim]Hint: press [bold]T[/bold] to compute Mash distances (threshold={threshold:.4f}); "
+                    f"[dim]Hint: press [bold]T[/bold] to compute genome distances (threshold={threshold:.4f}); "
                     "ensure sequences are local/cached.[/dim]"
                 )
         if round_entry.replace_with_ramax:

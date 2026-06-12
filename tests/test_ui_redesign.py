@@ -184,6 +184,59 @@ def test_tree_browser_scope_and_subtree_toggle():
     assert child.round.replace_with_ramax is False
 
 
+def test_tree_labels_use_biology_friendly_words():
+    root, child = _simple_tree()
+    root.round.mash_distance = 0.0144
+    child.round.replace_with_ramax = True
+    leaf = tree_utils.AlignmentNode(name="simHuman", parent=child)
+    child.children.append(leaf)
+    widget = PlanTreeBrowser(root)
+
+    root_label = widget._label_for(root).plain
+    child_label = widget._label_for(child).plain
+    leaf_label = widget._label_for(leaf).plain
+
+    assert root_label.startswith("Cactus Anc0")
+    assert "distance 0.0144" in root_label
+    assert " mash " not in root_label
+    assert child_label.startswith("RaMAx Anc1")
+    assert leaf_label == "Species simHuman"
+
+
+def test_tree_inline_search_finds_species_without_modal(tmp_path: Path):
+    seq = tmp_path / "seq.fa"
+    seq.write_text("(simHuman,simChimp)Anc0;\nsimHuman a.fa\nsimChimp b.fa\n", encoding="utf-8")
+    plan = _minimal_plan(tmp_path)
+    plan.out_seq_file = str(seq)
+
+    async def run_smoke() -> None:
+        app = PlanUIApp(plan, base_dir=tmp_path)
+        async with app.run_test(size=(120, 36)) as pilot:
+            await pilot.pause(0.3)
+            assert app.canvas is not None
+
+            await pilot.press("/")
+            await pilot.pause(0.1)
+            assert app.canvas._search_bar is not None
+            assert not app.canvas._search_bar.has_class("hidden")
+            assert app.canvas._search_input is not None
+            assert app.focused is app.canvas._search_input
+
+            app.canvas._search_input.value = "sim human"
+            await pilot.pause(0.1)
+            assert app.canvas.current_node().name == "simHuman"
+            assert app.canvas._search_count is not None
+            assert "1/1" in str(app.canvas._search_count.render())
+            assert type(app.screen).__name__ == "Screen"
+
+            await pilot.press("escape")
+            await pilot.pause(0.1)
+            assert app.canvas._search_bar.has_class("hidden")
+            assert app.focused is app.canvas._tree
+
+    asyncio.run(run_smoke())
+
+
 def test_plan_ui_mounts_native_tree(tmp_path: Path):
     seq = tmp_path / "seq.fa"
     seq.write_text("(leaf1,leaf2)Anc0;\nleaf1 a.fa\nleaf2 b.fa\n", encoding="utf-8")
@@ -785,11 +838,15 @@ def test_plan_ui_handles_large_tree_keyboard_navigation(tmp_path: Path):
             assert tree.cursor_node is not None
             assert tree.cursor_node.data is app.canvas.current_node()
             assert app.status_bar is not None
-            assert "E edit" in str(app.status_bar.render())
-            assert "I details" in str(app.status_bar.render())
+            status_text = str(app.status_bar.render())
+            assert "Space RaMAx" in status_text
+            assert "T Distance" in status_text
+            assert "R Run" in status_text
             assert "/ search" in str(app.status_bar.render())
-            assert "T mash" in str(app.status_bar.render())
-            assert "X fold/open" in str(app.status_bar.render())
+            assert "E edit" not in status_text
+            assert "I details" not in status_text
+            assert "X fold/open" not in status_text
+            assert "B scope" not in str(app.status_bar.render())
             assert "Move:" not in str(app.status_bar.render())
             assert "Z expand" not in str(app.status_bar.render())
             await pilot.press("k")
