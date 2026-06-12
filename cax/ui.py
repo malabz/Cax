@@ -1,11 +1,10 @@
 """Textual-based interactive UI for configuring CAX plans."""
 from __future__ import annotations
 
-import itertools
-import math
+import queue
 import shlex
 import shutil
-import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional
@@ -14,25 +13,30 @@ import psutil
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical
+from textual.containers import Container, VerticalScroll
 from textual.screen import ModalScreen, Screen
 from textual.worker import Worker, WorkerState
-from textual.widgets import Button, Checkbox, Footer, Header, Input, ListItem, ListView, Static, TextArea
+from textual.widgets import Header, Input, RichLog, Static, TextArea
+from textual.widgets import Tree as TextualTree
+from textual.widgets._tree import TreeNode
 
-from rich.console import Console, Group, RenderableType
+from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from rich.tree import Tree
-from rich.align import Align
-from rich.console import Group
 
-from . import mash_auto as mash_auto_module, planner, resume as resume_utils, seq_cache, tree_utils
+from . import mash_auto as mash_auto_module, planner, seq_cache, tree_utils
 from .models import Plan, Round, RunSettings, Step
 from .planner import PlannedCommand
+from .runner import PlanRunner, RunnerEvent
 
 
 SUBTREE_MODE_FLAG = "--subtree-mode"
+TREE_STATUS_HELP = "E edit · R run · I details · / search · T mash · Space RaMAx · B scope · X fold/open · Q quit"
+RUN_ITEM_STYLE = "white"
+RUN_VALUE_STYLE = "#94a3b8"
+RUN_HELP_STYLE = "italic dim #64748b"
+RUN_SELECTED_STYLE = "bold white on #0e7490"
 
 
 def _is_subtree_mode_round(round_entry: Round) -> bool:
@@ -189,9 +193,16 @@ def render_run_script(plan: Plan, commands: Iterable[PlannedCommand]) -> str:
 
 
 class CommandSelectionModal(ModalScreen[CommandTarget | None]):
-    """Modal dialog listing all editable commands for a round."""
+    """Keyboard-first picker for editable commands on a round."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "confirm", "Edit"),
+        Binding("up", "cursor_up", show=False),
+        Binding("down", "cursor_down", show=False),
+        Binding("k", "cursor_up", show=False),
+        Binding("j", "cursor_down", show=False),
+    ]
 
     CSS = """
     CommandSelectionModal {
@@ -210,6 +221,7 @@ class CommandSelectionModal(ModalScreen[CommandTarget | None]):
     #picker-list {
         height: auto;
         max-height: 20;
+        overflow-y: auto;
     }
     #picker-hint {
         padding-top: 1;
@@ -217,46 +229,73 @@ class CommandSelectionModal(ModalScreen[CommandTarget | None]):
     }
     """
 
-    def __init__(self, targets: list[CommandTarget]):
+    def __init__(self, targets: list[CommandTarget], initial_index: int = 0):
         super().__init__()
         self.targets = targets
-        self._list_view: ListView | None = None
+        self._index = max(0, min(initial_index, len(targets) - 1)) if targets else 0
+        self._list: Static | None = None
 
     def compose(self) -> ComposeResult:
         with Container(id="picker-dialog"):
             yield Static("Choose a command to edit", id="picker-title")
-            items = []
-            for target in self.targets:
-                text = Text(target.label, style="bold")
-                text.append("\n")
-                text.append(target.command)
-                items.append(ListItem(Static(text, expand=True)))
-            list_view = ListView(*items, id="picker-list")
-            self._list_view = list_view
-            yield list_view
-            yield Static("Enter to confirm, Esc to cancel", id="picker-hint")
+            picker_list = Static(id="picker-list")
+            self._list = picker_list
+            yield picker_list
+            yield Static("Up/Down choose | Enter edit | Esc back", id="picker-hint")
 
     def on_mount(self) -> None:
-        if self._list_view:
-            self._list_view.index = 0
-            self.set_focus(self._list_view)
+        self._refresh()
 
-    def on_list_view_selected(self, event: ListView.Selected) -> None:
-        if event.index < len(self.targets):
-            self.dismiss(self.targets[event.index])
+    def action_cursor_up(self) -> None:
+        self._move(-1)
+
+    def action_cursor_down(self) -> None:
+        self._move(+1)
+
+    def action_confirm(self) -> None:
+        if 0 <= self._index < len(self.targets):
+            self.dismiss(self.targets[self._index])
 
     def action_cancel(self) -> None:
         self.dismiss(None)
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "save":
-            self.action_save()
-        elif event.button.id == "cancel":
-            self.action_cancel()
+    def _move(self, delta: int) -> None:
+        if not self.targets:
+            return
+        self._index = (self._index + delta) % len(self.targets)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        if not self._list:
+            return
+        text = Text()
+        if not self.targets:
+            text.append("No editable commands for this round.", style="dim")
+            self._list.update(text)
+            return
+        for index, target in enumerate(self.targets):
+            selected = index == self._index
+            prefix = "> " if selected else "  "
+            style = "bold white on #0e7490" if selected else "white"
+            text.append(prefix, style=style)
+            text.append(target.label, style=style)
+            text.append("\n")
+            text.append("  ")
+            text.append(self._shorten(target.command), style="dim")
+            if index < len(self.targets) - 1:
+                text.append("\n")
+        self._list.update(text)
+
+    def _shorten(self, command: str) -> str:
+        command = " ".join(command.split())
+        width = max(40, min(110, self.size.width - 12))
+        if len(command) <= width:
+            return command
+        return command[: width - 1] + "…"
 
 
 class CommandEditModal(ModalScreen[str | None]):
-    """Modal dialog allowing the user to edit a command string."""
+    """Keyboard-first modal for editing a command string."""
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
@@ -280,16 +319,12 @@ class CommandEditModal(ModalScreen[str | None]):
     #editor-command {
         margin-bottom: 1;
     }
-    #editor-buttons {
-        layout: horizontal;
-        height: auto;
-        padding-top: 1;
-    }
-    #editor-buttons Button {
-        margin-right: 1;
-    }
     #editor-status {
         color: $error;
+    }
+    #editor-hint {
+        color: $text-muted;
+        padding-top: 1;
     }
     """
 
@@ -310,9 +345,7 @@ class CommandEditModal(ModalScreen[str | None]):
             status = Static("", id="editor-status")
             self._status = status
             yield status
-            with Container(id="editor-buttons"):
-                yield Button("Save", id="save", variant="success")
-                yield Button("Cancel", id="cancel")
+            yield Static("Ctrl+S save | Esc back", id="editor-hint")
 
     def on_mount(self) -> None:
         if self._editor:
@@ -426,6 +459,93 @@ class SearchModal(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+THREAD_AUTO = "auto"
+
+
+class ThreadCountModal(ModalScreen[int | str | None]):
+    """Keyboard-first thread-count editor."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    CSS = """
+    ThreadCountModal {
+        align: center middle;
+    }
+    #threads-dialog {
+        padding: 1 2;
+        min-width: 50;
+        border: round $accent;
+        background: $panel;
+        layout: vertical;
+    }
+    #threads-title {
+        padding-bottom: 1;
+    }
+    #threads-input {
+        width: 100%;
+    }
+    #threads-hint {
+        padding-top: 1;
+        color: $text-muted;
+    }
+    #threads-status {
+        padding-top: 1;
+        color: $error;
+    }
+    """
+
+    def __init__(self, current: Optional[int]):
+        super().__init__()
+        self.current = current
+        self._input: Input | None = None
+        self._status: Static | None = None
+
+    def compose(self) -> ComposeResult:
+        with Container(id="threads-dialog"):
+            yield Static("Thread count", id="threads-title")
+            input_widget = Input(
+                value="" if self.current is None else str(self.current),
+                placeholder="auto or a positive integer",
+                id="threads-input",
+            )
+            self._input = input_widget
+            yield input_widget
+            yield Static("Enter apply | empty/auto for auto | Esc back", id="threads-hint")
+            status = Static("", id="threads-status")
+            self._status = status
+            yield status
+
+    def on_mount(self) -> None:
+        if self._input:
+            self.set_focus(self._input)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "threads-input":
+            self._apply(event.value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _apply(self, raw: str) -> None:
+        text = raw.strip().lower()
+        if not text or text in {"a", "auto"}:
+            self.dismiss(THREAD_AUTO)
+            return
+        try:
+            value = int(text)
+        except ValueError:
+            self._update_status("Thread count must be a positive integer, or auto.")
+            return
+        if value <= 0:
+            self._update_status("Thread count must be at least 1.")
+            return
+        self.dismiss(value)
+
+    def _update_status(self, message: str | None) -> None:
+        if self._status:
+            self._status.update(message or "")
+
+
 class MashThresholdModal(ModalScreen[float | None]):
     """Modal dialog to adjust Mash distance threshold and reapply auto-selection."""
 
@@ -456,17 +576,6 @@ class MashThresholdModal(ModalScreen[float | None]):
         padding-top: 1;
         color: $error;
     }
-    #mash-buttons {
-        padding-top: 1;
-        layout: horizontal;
-        content-align: right middle;
-    }
-    #mash-buttons Button {
-        margin-left: 1;
-    }
-    #mash-buttons Button:first-child {
-        margin-left: 0;
-    }
     """
 
     def __init__(self, initial: float):
@@ -485,13 +594,10 @@ class MashThresholdModal(ModalScreen[float | None]):
             )
             self._input = threshold_input
             yield threshold_input
-            yield Static("Example: 0.04", id="mash-hint")
+            yield Static("Example: 0.04 | Enter apply | Esc cancel", id="mash-hint")
             status = Static("", id="mash-status")
             self._status = status
             yield status
-            with Container(id="mash-buttons"):
-                yield Button("Apply", id="mash-apply", variant="success")
-                yield Button("Cancel", id="mash-cancel")
 
     def on_mount(self) -> None:
         if self._input:
@@ -527,16 +633,10 @@ class MashThresholdModal(ModalScreen[float | None]):
         if event.input.id == "mash-threshold":
             self._apply()
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "mash-apply":
-            self._apply()
-        elif event.button.id == "mash-cancel":
-            self.action_cancel()
-
 
 @dataclass
 class _DetailCallback:
-    """Wrapper to forward detail updates from AsciiPhylo to the host app."""
+    """Wrapper to forward focused-node updates to the host app."""
 
     handler: Optional[Callable[[tree_utils.AlignmentNode, Optional[str]], None]] = None
 
@@ -545,638 +645,17 @@ class _DetailCallback:
             self.handler(node, status=status)
 
 
-class AsciiPhylo(Static):
-    """Full-screen ASCII phylogenetic tree widget."""
-
-    DEFAULT_CSS = """
-    AsciiPhylo {
-        width: 1fr;
-        height: 1fr;
-        padding: 0 1;
-        overflow: hidden;
-        background: #0d1117;
-    }
-    """
-
-    can_focus = True
+class RoundPickerModal(ModalScreen[int | None]):
+    """Keyboard-first picker for choosing a round."""
 
     BINDINGS = [
-        Binding("up", "move_up", show=False),
-        Binding("down", "move_down", show=False),
-        Binding("left", "move_parent", show=False),
-        Binding("right", "move_child", show=False),
-        Binding("h", "move_parent", show=False),
-        Binding("j", "move_down", show=False),
-        Binding("k", "move_up", show=False),
-        Binding("l", "move_child", show=False),
-        Binding("space", "toggle_apply", "Toggle"),
-        Binding("b", "toggle_scope", "Scope node/subtree"),
-        Binding("/", "open_search", "Search"),
-        Binding("n", "search_next", show=False),
-        Binding("shift+n", "search_prev", show=False),
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "confirm", "Select"),
+        Binding("up", "cursor_up", show=False),
+        Binding("down", "cursor_down", show=False),
+        Binding("k", "cursor_up", show=False),
+        Binding("j", "cursor_down", show=False),
     ]
-
-    def __init__(self, root: tree_utils.AlignmentNode, *, id: str = "ascii-phylo"):
-        super().__init__("", id=id)
-        self._root = root
-        self._cursor = root
-        self._stack: list[tree_utils.AlignmentNode] = []
-        self._mode = "clado"
-        self._ascii_only = False
-        self._scale_x = 1.0  # Controls horizontal/vertical scaling.
-        self._x_gap = 6  # Leaf spacing on the horizontal grid.
-        self._view_x = 0
-        self._view_y = 0
-        self._ordered_children: dict[tree_utils.AlignmentNode, list[tree_utils.AlignmentNode]] = {}
-        self._y_map: dict[tree_utils.AlignmentNode, float] = {}
-        self._x_map: dict[tree_utils.AlignmentNode, int] = {}
-        self._linear: list[tree_utils.AlignmentNode] = []
-        self._state_cache: dict[tree_utils.AlignmentNode, str] = {}
-        self._search_term: Optional[str] = None
-        self._hits: list[tree_utils.AlignmentNode] = []
-        self._hit_index = 0
-        self._detail_callback = _DetailCallback()
-        self._content_width = 0
-        self._content_height = 0
-        self._visual = Text()
-        self._toggle_scope: str = "subtree"  # node | subtree
-        self._bulk_root: tree_utils.AlignmentNode | None = None
-        self._bulk_state: bool | None = None
-
-    def set_detail_callback(
-        self,
-        callback: Optional[Callable[[tree_utils.AlignmentNode, Optional[str]], None]],
-    ) -> None:
-        self._detail_callback.handler = callback
-
-    def current_node(self) -> tree_utils.AlignmentNode:
-        return self._cursor
-
-    def on_mount(self) -> None:
-        self.focus()
-        self._layout()
-
-    def on_resize(self, event: events.Resize) -> None:  # type: ignore[override]
-        self._rebuild_visual()
-        self.refresh()
-
-    def action_move_up(self) -> None:
-        self._move_cursor(-1)
-
-    def action_move_down(self) -> None:
-        self._move_cursor(+1)
-
-    def action_move_parent(self) -> None:
-        parent = getattr(self._cursor, "parent", None)
-        if parent:
-            self._set_cursor(parent, ensure_visible=True)
-
-    def action_move_child(self) -> None:
-        children = self._ordered_children.get(self._cursor, self._cursor.children)
-        if not children:
-            return
-        for child in children:
-            if not self._is_species_leaf(child):
-                self._set_cursor(child, ensure_visible=True)
-                return
-        self._notify(self._cursor, "Only species leaves under this node.")
-
-    def action_toggle_apply(self) -> None:
-        """Toggle apply behavior according to the current scope (single node or subtree)."""
-        if self._toggle_scope == "subtree":
-            self._toggle_subtree()
-        else:
-            self._toggle_single()
-
-    def action_toggle_scope(self) -> None:
-        """Switch scope mode and highlight the current subtree as a cue."""
-        self._toggle_scope = "subtree" if self._toggle_scope == "node" else "node"
-        scope_label = "Subtree" if self._toggle_scope == "subtree" else "Single node"
-        self._rebuild_visual()
-        self.refresh()
-        self._notify(self._cursor, f"Scope switched to: {scope_label}")
-
-    def _toggle_single(self) -> None:
-        if not self._cursor.round:
-            self._notify(self._cursor, "No round on this node; nothing to toggle.")
-            return
-        # If a parent subtree was toggled in bulk, revert it first to avoid mixed states.
-        if self._maybe_revert_bulk(self._cursor):
-            return
-            
-        round_entry = self._cursor.round
-        
-        # Remove subtree flag if present (switching from Subtree -> Node mode effectively)
-        if "--subtree-mode" in round_entry.ramax_opts:
-            round_entry.ramax_opts.remove("--subtree-mode")
-            
-        round_entry.replace_with_ramax = not round_entry.replace_with_ramax
-        state = "RaMAx (Node)" if round_entry.replace_with_ramax else "cactus"
-        self._rebuild_visual()
-        self.refresh()
-        self._notify(self._cursor, f"Current round switched to {state}")
-
-    def _toggle_subtree(self) -> None:
-        """
-        Toggle Subtree Mode (Mode B):
-        - Enable RaMAx for this node.
-        - 标记内部“subtree-mode”（仅用于 CAX 控制，不会传给 ramax）。
-        - Disable RaMAx for all descendant nodes (as they are subsumed).
-        """
-        if not self._cursor.round:
-            self._notify(self._cursor, "No round on this node to apply subtree mode.")
-            return
-            
-        round_entry = self._cursor.round
-        
-        # Check if currently enabled as subtree
-        is_subtree_active = round_entry.replace_with_ramax and "--subtree-mode" in round_entry.ramax_opts
-        
-        target_state = not is_subtree_active
-        
-        if target_state:
-            # Enable Subtree Mode
-            round_entry.replace_with_ramax = True
-            if "--subtree-mode" not in round_entry.ramax_opts:
-                round_entry.ramax_opts.append("--subtree-mode")
-            
-            # Disable all descendants
-            descendants = self._collect_round_nodes(self._cursor)
-            count_disabled = 0
-            for desc in descendants:
-                if desc is self._cursor: continue
-                if desc.round and desc.round.replace_with_ramax:
-                    desc.round.replace_with_ramax = False
-                    # Also clean their subtree flags if any
-                    if "--subtree-mode" in desc.round.ramax_opts:
-                        desc.round.ramax_opts.remove("--subtree-mode")
-                    count_disabled += 1
-            
-            msg = f"Enabled Subtree RaMAx. Overridden {count_disabled} descendant(s)."
-        else:
-            # Disable Subtree Mode
-            round_entry.replace_with_ramax = False
-            if "--subtree-mode" in round_entry.ramax_opts:
-                round_entry.ramax_opts.remove("--subtree-mode")
-            msg = "Disabled Subtree RaMAx."
-
-        self._rebuild_visual()
-        self.refresh()
-        self._notify(self._cursor, msg)
-
-    def _maybe_revert_bulk(self, node: tree_utils.AlignmentNode) -> bool:
-        """
-        Check if any ancestor is in Subtree Mode. If so, disable that mode to allow node-level edits.
-        Returns True if an ancestor was modified (reverted), signaling the caller to stop.
-        """
-        current = getattr(node, "parent", None)
-        ancestor_conflict: tree_utils.AlignmentNode | None = None
-        
-        while current:
-            if current.round and current.round.replace_with_ramax:
-                if "--subtree-mode" in current.round.ramax_opts:
-                    ancestor_conflict = current
-                    break
-            current = getattr(current, "parent", None)
-            
-        if not ancestor_conflict:
-            return False
-
-        # Revert the ancestor's Subtree Mode
-        if ancestor_conflict.round:
-            ancestor_conflict.round.ramax_opts.remove("--subtree-mode")
-            # Option: also disable RaMAx entirely? 
-            # "Cancel the replacement" implies setting replace_with_ramax = False?
-            # Let's stick to degrading to Node Mode first, as it's safer.
-            # But user said: "直接取消这个大子树的替换" -> replace_with_ramax = False
-            ancestor_conflict.round.replace_with_ramax = False
-
-        self._rebuild_visual()
-        self.refresh()
-        ancestor_label = _node_display_name(ancestor_conflict)
-        self._notify(
-            node,
-            f"Conflict: Subtree mode on ancestor '{ancestor_label}' has been disabled.",
-        )
-        
-        # Show modal
-        try:
-            app = self.app  # May raise when not running inside a Textual app (e.g., unit tests).
-        except Exception:
-            app = None
-
-        if app and hasattr(app, "push_screen"):
-            app.push_screen(
-                InfoModal(
-                    "Subtree Mode Disabled",
-                    (
-                        f"The ancestor node '{ancestor_label}' was in Subtree Mode.\n\n"
-                        "Since you are modifying a child node independently, the ancestor's "
-                        "subtree-wide replacement has been cancelled to avoid conflicts."
-                    ),
-                )
-            )
-            
-        return True
-
-    def action_toggle_ascii(self) -> None:
-        pass
-
-    def action_open_search(self) -> None:
-        prompt = SearchModal(self._search_term or "")
-        self.app.push_screen(prompt, self._apply_search_term)
-
-    def action_search_next(self) -> None:
-        self._jump_hit(+1)
-
-    def action_search_prev(self) -> None:
-        self._jump_hit(-1)
-
-    def _apply_search_term(self, term: str | None) -> None:
-        if term is None:
-            return
-        cleaned = term.strip().lower()
-        if not cleaned:
-            self._search_term = None
-            self._hits.clear()
-            self._rebuild_visual()
-            self.refresh()
-            return
-        self._search_term = cleaned
-        self._hits = [
-            node for node in self._linear if cleaned in _node_search_text(node)
-        ]
-        self._hit_index = 0
-        if self._hits:
-            self._set_cursor(self._hits[0], ensure_visible=True)
-            self._notify(self._cursor, f"Found {len(self._hits)} match(es).")
-        else:
-            self._notify(self._cursor, "No matching nodes found.")
-
-    def _jump_hit(self, delta: int) -> None:
-        if not self._hits:
-            return
-        self._hit_index = (self._hit_index + delta) % len(self._hits)
-        self._set_cursor(self._hits[self._hit_index], ensure_visible=True)
-
-    def _is_species_leaf(self, node: tree_utils.AlignmentNode) -> bool:
-        return not node.children and node.round is None
-
-    def _collect_subtree_nodes(self, node: tree_utils.AlignmentNode) -> set[tree_utils.AlignmentNode]:
-        nodes: set[tree_utils.AlignmentNode] = set()
-        stack = [node]
-        while stack:
-            current = stack.pop()
-            if current in nodes:
-                continue
-            nodes.add(current)
-            for child in self._ordered_children.get(current, current.children):
-                stack.append(child)
-        return nodes
-
-    def _collect_round_nodes(self, node: tree_utils.AlignmentNode) -> set[tree_utils.AlignmentNode]:
-        if node is None:
-            return set()
-        return {candidate for candidate in self._collect_subtree_nodes(node) if candidate.round}
-
-    def _move_cursor(self, delta: int) -> None:
-        if not self._linear:
-            return
-        try:
-            index = self._linear.index(self._cursor)
-        except ValueError:
-            index = 0
-        direction = 1 if delta >= 0 else -1
-        next_index = max(0, min(len(self._linear) - 1, index + delta))
-        while 0 <= next_index < len(self._linear):
-            candidate = self._linear[next_index]
-            if not self._is_species_leaf(candidate):
-                self._set_cursor(candidate, ensure_visible=True)
-                return
-            next_index += direction
-
-    def _set_cursor(self, node: tree_utils.AlignmentNode, ensure_visible: bool = False) -> None:
-        self._cursor = node
-        if ensure_visible:
-            self._ensure_visible(node)
-        self._rebuild_visual()
-        self.refresh()
-        self._notify(node)
-
-    def _notify(self, node: tree_utils.AlignmentNode, status: Optional[str] = None) -> None:
-        self._detail_callback(node, status=status)
-
-    def _layout(self) -> None:
-        if not self._root:
-            self.update("No tree structure found")
-            return
-        size_map: dict[tree_utils.AlignmentNode, int] = {}
-
-        def compute_size(node: tree_utils.AlignmentNode) -> int:
-            total = 1
-            for child in node.children:
-                total += compute_size(child)
-            size_map[node] = total
-            return total
-
-        compute_size(self._root)
-
-        self._ordered_children.clear()
-
-        def order_children(node: tree_utils.AlignmentNode) -> None:
-            ordered = sorted(
-                node.children,
-                key=lambda c: size_map.get(c, 1),
-                reverse=True,
-            )
-            self._ordered_children[node] = ordered
-            for child in ordered:
-                order_children(child)
-
-        order_children(self._root)
-
-        self._y_map.clear()
-        self._x_map.clear()
-        self._linear.clear()
-
-        leaf_index = 0
-
-        def assign_x(node: tree_utils.AlignmentNode) -> float:
-            """Horizontal layout: leaves are evenly spaced; internal nodes take the mean of their children."""
-            nonlocal leaf_index
-            children = self._ordered_children.get(node, [])
-            if not children:
-                gap = max(3, int(self._x_gap * self._scale_x))
-                self._x_map[node] = float(leaf_index * gap)
-                leaf_index += 1
-                return self._x_map[node]
-            child_xs = [assign_x(child) for child in children]
-            center = sum(child_xs) / len(child_xs)
-            self._x_map[node] = center
-            return center
-
-        assign_x(self._root)
-
-        self._y_map[self._root] = 0.0
-        base_step = max(3, int(4 * self._scale_x))
-        
-        # Find the longest branch to normalize the visual spacing.
-        max_len = 0.0
-        def find_max_len(node: tree_utils.AlignmentNode) -> None:
-            nonlocal max_len
-            if node.length is not None:
-                max_len = max(max_len, node.length)
-            for child in node.children:
-                find_max_len(child)
-        find_max_len(self._root)
-        self._max_branch_length = max_len if max_len > 0 else 1.0
-
-        def assign_y(node: tree_utils.AlignmentNode) -> None:
-            base_y = self._y_map[node]
-            children = self._ordered_children.get(node, [])
-            for child in children:
-                if self._mode == "phylo":
-                    increment = child.length if child.length is not None else 1.0
-                    increment = max(0.1, increment)
-                else:
-                    increment = 1.0
-                delta = max(2, int(math.ceil(base_step * increment)))
-                self._y_map[child] = base_y + delta
-                assign_y(child)
-
-        assign_y(self._root)
-
-        self._linear = sorted(
-            self._y_map.keys(),
-            key=lambda node: (self._y_map[node], self._x_map.get(node, 0)),
-        )
-        if self._cursor not in self._linear:
-            self._cursor = self._root
-        self._content_width = int(max(self._x_map.values(), default=0)) + 20
-        max_y = math.ceil(max(self._y_map.values(), default=0))
-        self._content_height = max_y + 6
-        self._ensure_visible(self._cursor)
-        self._rebuild_visual()
-        self.refresh()
-
-    def _ensure_visible(self, node: tree_utils.AlignmentNode) -> None:
-        width = max(40, self.size.width - 2)
-        height = max(10, self.size.height - 2)
-        x = self._x_map.get(node, 0)
-        y = int(round(self._y_map.get(node, 0)))
-        margin = 2
-        if x < self._view_x + margin:
-            self._view_x = max(0, x - margin)
-        elif x >= self._view_x + width - margin:
-            self._view_x = x - (width - margin - 1)
-        if y < self._view_y + margin:
-            self._view_y = max(0, y - margin)
-        elif y >= self._view_y + height - margin:
-            self._view_y = y - (height - margin - 1)
-        max_x = max(0, self._content_width - width)
-        max_y = max(0, self._content_height - height)
-        self._view_x = max(0, min(self._view_x, max_x))
-        self._view_y = max(0, min(self._view_y, max_y))
-
-    def _glyphs(self) -> dict[str, str]:
-        if self._ascii_only:
-            return {
-                "h": "-",
-                "v": "|",
-                "tee": "+",
-                "elbow": "+",
-                "top": "+",
-                "dot": "*",
-                "lite": "o",
-                "parent": "O",
-            }
-        return {
-            "h": "─",
-            "v": "│",
-            "tee": "├─",
-            "elbow": "└─",
-            "top": "┌─",
-            "dot": "●",
-            "lite": "○",
-            "parent": "◈",
-        }
-
-    def _compute_states(self) -> None:
-        self._state_cache.clear()
-
-        def helper(current: tree_utils.AlignmentNode) -> str:
-            children = self._ordered_children.get(current, current.children)
-            child_states = [helper(child) for child in children]
-            child_has_round = any(state != "leaf" for state in child_states)
-            descendant_enabled = any(state in ("checked", "mixed") for state in child_states)
-
-            if current.round:
-                if current.round.replace_with_ramax:
-                    result = "checked"
-                elif descendant_enabled:
-                    result = "mixed"
-                else:
-                    result = "unchecked"
-            else:
-                if not child_has_round:
-                    result = "leaf"
-                elif descendant_enabled:
-                    result = "mixed"
-                else:
-                    result = "unchecked"
-            self._state_cache[current] = result
-            return result
-
-        helper(self._root)
-
-    def _node_state(self, node: tree_utils.AlignmentNode) -> str:
-        return self._state_cache.get(node, "leaf")
-
-    def _state_color(self, node: tree_utils.AlignmentNode) -> str:
-        state = self._node_state(node)
-        if state == "checked":
-            return "#2ecc71"
-        if state == "mixed":
-            return "#f39c12"
-        if state == "unchecked":
-            return "#94a3b8"
-        return "#aeb8cc"
-
-    def _connector_highlight(self, parent_kind: str | None, child_kind: str | None) -> str | None:
-        if parent_kind == "ramax" and child_kind == "ramax":
-            return "ramax"
-        if parent_kind == "selected" or child_kind == "selected":
-            return "selected"
-        return None
-
-    def _rebuild_visual(self) -> None:
-        highlight_subtree = self._toggle_scope == "subtree"
-        highlighted_nodes: set[tree_utils.AlignmentNode] = set()
-        if highlight_subtree and self._cursor:
-            highlighted_nodes = self._collect_subtree_nodes(self._cursor)
-
-        # 计算每个节点“执行层面”的有效 RaMAx 状态：当祖先处于 Subtree Mode 时，后代 round 也视为 RaMAx。
-        effective_ramax: dict[tree_utils.AlignmentNode, bool] = {}
-
-        def propagate_effective(node: tree_utils.AlignmentNode, covered: bool) -> None:
-            node_effective = bool(node.round and (node.round.replace_with_ramax or covered))
-            effective_ramax[node] = node_effective
-            subtree_cover = covered or bool(node.round and _is_subtree_mode_round(node.round))
-            for child in self._ordered_children.get(node, node.children):
-                propagate_effective(child, subtree_cover)
-
-        propagate_effective(self._root, False)
-
-        def node_kind(node: tree_utils.AlignmentNode) -> str:
-            if node.round and effective_ramax.get(node, False):
-                return "ramax"
-            if node.round:
-                return "cactus"
-            if node.children:
-                return "clade"
-            return "leaf"
-
-        def display_name(node: tree_utils.AlignmentNode) -> str:
-            return _node_display_name(node)
-
-        def append_node_label(line: Text, node: tree_utils.AlignmentNode) -> None:
-            kind = node_kind(node)
-            marker_by_kind = {
-                "ramax": "R",
-                "cactus": "C",
-                "clade": "◇" if not self._ascii_only else "o",
-                "leaf": "●" if not self._ascii_only else "*",
-            }
-            marker_style_by_kind = {
-                "ramax": "bold #f59e0b",
-                "cactus": "bold #22d3ee",
-                "clade": "dim #7dd3fc",
-                "leaf": "#86efac",
-            }
-            name_style_by_kind = {
-                "ramax": "bold #fbbf24",
-                "cactus": "bold #67e8f9",
-                "clade": "dim #93c5fd",
-                "leaf": "#bbf7d0",
-            }
-
-            if node is self._cursor:
-                line.append("▸ " if not self._ascii_only else "> ", style="bold #c084fc")
-                name_style = "bold #f8fafc on #4c1d95"
-            elif highlight_subtree and node in highlighted_nodes and node.round:
-                line.append("• " if not self._ascii_only else "+ ", style="#94a3b8")
-                name_style = name_style_by_kind[kind]
-            else:
-                line.append("  ", style="dim #334155")
-                name_style = name_style_by_kind[kind]
-
-            line.append(marker_by_kind[kind], style=marker_style_by_kind[kind])
-            line.append(" ")
-            line.append(display_name(node), style=name_style)
-
-            if node.round and node.round.mash_distance is not None:
-                mash_label = f" mash {node.round.mash_distance:.4f}"
-                src = getattr(node.round, "mash_source", None)
-                if src and src != node.round.root:
-                    mash_label = f"{mash_label}@{src}"
-                line.append(mash_label, style="dim #94a3b8")
-
-            if node.length is not None:
-                line.append(f" · {node.length:.4g}", style="dim #64748b")
-
-        if self._ascii_only:
-            tee = "+- "
-            elbow = "`- "
-            pipe = "|  "
-            space = "   "
-        else:
-            tee = "├─ "
-            elbow = "└─ "
-            pipe = "│  "
-            space = "   "
-
-        # Pass 1: Build base lines and calculate max width
-        final_lines: list[Text] = []
-        self._x_map.clear()
-        self._y_map.clear()
-
-        def walk(node: tree_utils.AlignmentNode, prefix: str, is_last: bool, depth: int) -> None:
-            connector = "" if depth == 0 else (elbow if is_last else tee)
-            line = Text()
-            line.append(prefix, style="#475569")
-            if connector:
-                line.append(connector, style="#475569")
-            append_node_label(line, node)
-
-            y = len(final_lines)
-            x = len(prefix) + (0 if depth == 0 else len(connector))
-            self._x_map[node] = x
-            self._y_map[node] = y
-            final_lines.append(line)
-
-            children = self._ordered_children.get(node, [])
-            for idx, child in enumerate(children):
-                child_is_last = idx == len(children) - 1
-                child_prefix = prefix + (space if is_last else pipe)
-                walk(child, child_prefix, child_is_last, depth + 1)
-
-        walk(self._root, "", True, 0)
-
-        self._linear = sorted(self._y_map.keys(), key=lambda n: (self._y_map[n], self._x_map[n]))
-        self._content_height = len(final_lines)
-        self._content_width = max((t.cell_len for t in final_lines), default=0)
-        self._view_x = 0
-        self._view_y = 0
-        self._visual = Text("\n").join(final_lines)
-
-    def render(self) -> Text:  # type: ignore[override]
-        return self._visual
-
-
-class RoundPickerModal(ModalScreen[int | None]):
-    """Modal dialog for picking a round when no node is focused."""
-
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
     CSS = """
     RoundPickerModal {
@@ -1192,6 +671,7 @@ class RoundPickerModal(ModalScreen[int | None]):
     #round-picker-list {
         height: auto;
         max-height: 24;
+        overflow-y: auto;
     }
     #round-picker-hint {
         padding-top: 1;
@@ -1202,477 +682,562 @@ class RoundPickerModal(ModalScreen[int | None]):
     def __init__(self, rounds: list[Round]):
         super().__init__()
         self.rounds = rounds
-        self._list: ListView | None = None
+        self._index = 0
+        self._list: Static | None = None
 
     def compose(self) -> ComposeResult:
         with Container(id="round-picker"):
-            items = []
-            for round_entry in self.rounds:
-                label = Text(round_entry.name, style="bold")
-                label.append(f" ({round_entry.root})")
-                label.append("\n")
-                label.append(round_entry.target_hal)
-                items.append(ListItem(Static(label, expand=True)))
-            self._list = ListView(*items, id="round-picker-list")
-            yield self._list
-            yield Static("Enter to confirm, Esc to cancel", id="round-picker-hint")
+            yield Static("Choose a round", id="round-picker-title")
+            round_list = Static(id="round-picker-list")
+            self._list = round_list
+            yield round_list
+            yield Static("Up/Down choose | Enter edit | Esc back", id="round-picker-hint")
 
     def on_mount(self) -> None:
-        if self._list:
-            self._list.index = 0
-            self.set_focus(self._list)
+        self._refresh()
 
-    def on_list_view_selected(self, event: ListView.Selected) -> None:
-        self.dismiss(event.index)
+    def action_cursor_up(self) -> None:
+        self._move(-1)
+
+    def action_cursor_down(self) -> None:
+        self._move(+1)
+
+    def action_confirm(self) -> None:
+        self.dismiss(self._index if self.rounds else None)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
 
+    def _move(self, delta: int) -> None:
+        if not self.rounds:
+            return
+        self._index = (self._index + delta) % len(self.rounds)
+        self._refresh()
 
-class DetailBuffer:
-    """Stores the latest detail text and mirrors a short summary to the subtitle."""
-
-    def __init__(self, app: "PlanUIApp"):
-        self.app = app
-        self.text: str = ""
-        self.renderable: RenderableType | str = ""
-
-    def update(self, message: RenderableType | str) -> None:
-        self.renderable = message
-        if isinstance(message, str):
-            plain = message
-        else:
-            # Render rich content into plain text for later inspection.
-            temp_console = Console(width=120, record=True, color_system=None)
-            with temp_console.capture() as capture:
-                temp_console.print(message)
-            plain = capture.get()
-        self.text = plain
-        summary = plain.splitlines()[0] if plain else ""
-        if summary:
-            try:
-                summary_plain = Text.from_markup(summary).plain
-            except Exception:
-                summary_plain = summary
-        else:
-            summary_plain = ""
-        self.app.sub_title = summary_plain[:80]
+    def _refresh(self) -> None:
+        if not self._list:
+            return
+        text = Text()
+        if not self.rounds:
+            text.append("No rounds found.", style="dim")
+            self._list.update(text)
+            return
+        width = max(40, min(100, self.size.width - 12))
+        for index, round_entry in enumerate(self.rounds):
+            selected = index == self._index
+            prefix = "> " if selected else "  "
+            style = "bold white on #0e7490" if selected else "white"
+            text.append(prefix, style=style)
+            text.append(f"{round_entry.name} ({round_entry.root})", style=style)
+            text.append("\n")
+            target = round_entry.target_hal
+            if len(target) > width:
+                target = target[: width - 1] + "…"
+            text.append(f"  {target}", style="dim")
+            if index < len(self.rounds) - 1:
+                text.append("\n")
+        self._list.update(text)
 
 
-class DashboardHUD(Static):
-    """Bottom HUD panel that shows the current node status and summary."""
+class _PlanTextualTree(TextualTree[tree_utils.AlignmentNode]):
+    """Textual tree with CAX-owned selection and folding keys."""
 
-    def __init__(self) -> None:
-        super().__init__()
-        self._current_node: tree_utils.AlignmentNode | None = None
-        self._metrics: dict[str, object] = {}
-        self._gpu_disabled = False
-        self._spinner = itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+    BINDINGS = [
+        Binding("enter", "edit_round", show=False, priority=True),
+        Binding("up", "cursor_up", show=False),
+        Binding("down", "cursor_down", show=False),
+        Binding("shift+left", "cursor_parent", show=False),
+        Binding("shift+right", "cursor_parent_next_sibling", show=False),
+        Binding("shift+up", "cursor_previous_sibling", show=False),
+        Binding("shift+down", "cursor_next_sibling", show=False),
+    ]
 
-    def on_mount(self) -> None:  # type: ignore[override]
-        # Warm up CPU sampling so the first reading is not zero.
-        try:
-            psutil.cpu_percent(interval=None)
-        except Exception:
-            pass
-        self._metrics = self._collect_metrics()
-        self.update(self._render_empty())
-        self.set_interval(1.0, self._refresh_metrics)
+    async def _on_click(self, event: events.Click) -> None:
+        line = event.style.meta.get("line")
+        if line is None:
+            return
+        event.prevent_default()
+        event.stop()
+        self.cursor_line = line
+        tree_node = self.get_node_at_line(line)
+        parent = self.parent
+        if tree_node is not None and parent and hasattr(parent, "_sync_focused_tree_node"):
+            parent._sync_focused_tree_node(tree_node)
 
-    def update_node(self, node: tree_utils.AlignmentNode) -> None:
-        self._current_node = node
-        self.update(self._render_dashboard(node))
+    def action_toggle_node(self) -> None:
+        parent = self.parent
+        if parent and hasattr(parent, "action_toggle_apply"):
+            parent.action_toggle_apply()
 
-    def update_node_placeholder(self, renderable: RenderableType | str) -> None:
-        self._current_node = None
-        self.update(renderable)
+    def action_select_cursor(self) -> None:
+        parent = self.parent
+        if parent and hasattr(parent, "_sync_focused_tree_node") and self.cursor_node:
+            parent._sync_focused_tree_node(self.cursor_node)
 
-    def update_message(self, renderable: RenderableType | str) -> None:
-        self.update(renderable)
+    def action_edit_round(self) -> None:
+        parent = self.parent
+        if parent and hasattr(parent, "action_edit_round"):
+            parent.action_edit_round()
 
-    def _refresh_metrics(self) -> None:
-        self._metrics = self._collect_metrics()
-        if self._current_node:
-            self.update(self._render_dashboard(self._current_node))
 
-    def _render_empty(self) -> Panel:
-        return Panel(Align.center("Waiting for selection...", vertical="middle"), title="System Status")
+class PlanTreeBrowser(Static):
+    """Scrollable and collapsible tree browser backed by Textual's native Tree."""
 
-    def _draw_bar(self, percentage: float, width: int = 15, color: str = "blue") -> Text:
-        percentage = max(0.0, min(1.0, percentage))
-        filled_len = int(percentage * width)
-        bar = "❚" * filled_len + "·" * (width - filled_len)
-        return Text(bar, style=color)
+    BINDINGS = [
+        Binding("up", "cursor_up", show=False),
+        Binding("down", "cursor_down", show=False),
+        Binding("left", "cursor_left", show=False),
+        Binding("right", "cursor_right", show=False),
+        Binding("b", "toggle_scope", "Scope"),
+        Binding("space", "toggle_apply", "Toggle RaMAx"),
+        Binding("enter", "edit_round", "Edit"),
+        Binding("/", "open_search", "Search"),
+        Binding("n", "search_next", "Next match"),
+        Binding("shift+n", "search_prev", "Prev match"),
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+        Binding("h", "cursor_left", "Parent", show=False),
+        Binding("l", "cursor_right", "Open", show=False),
+        Binding("x", "toggle_fold", "Fold/Open"),
+    ]
 
-    def _info_block(self, label: str, body: RenderableType, *, accent: str = "white") -> RenderableType:
-        title = Text(label, style=f"bold {accent}")
-        return Group(title, body)
+    DEFAULT_CSS = """
+    PlanTreeBrowser {
+        width: 1fr;
+        height: 1fr;
+        layout: vertical;
+        min-height: 0;
+    }
+    PlanTreeBrowser > Tree {
+        height: 1fr;
+        width: 1fr;
+        min-height: 0;
+        overflow: auto;
+    }
+    """
 
-    def _subtree_stats(self, node: tree_utils.AlignmentNode) -> dict[str, object]:
-        rounds = list(node.iter_rounds())
-        total_rounds = len(rounds)
-        hal2fasta = sum(len(r.hal2fasta_steps) for r in rounds)
+    def __init__(self, root: tree_utils.AlignmentNode, *, id: str = "plan-tree-browser"):
+        super().__init__("", id=id)
+        self.root_node = root
+        self.scope = "subtree"
+        self._tree: TextualTree[tree_utils.AlignmentNode] | None = None
+        self._node_to_tree: dict[tree_utils.AlignmentNode, TreeNode[tree_utils.AlignmentNode]] = {}
+        self._focused_node = root
+        self._search_term: str | None = None
+        self._hits: list[tree_utils.AlignmentNode] = []
+        self._hit_index = 0
+        self._detail_callback = _DetailCallback()
 
-        # 子树模式（Subtree Mode）下，后代 round 会被标记成 Cactus 以避免混合状态，但执行上会被祖先 RaMAx 吸收；
-        # 这里统计覆盖率时应使用“有效 RaMAx”口径，否则用户看到的覆盖率会与实际执行计划不一致。
-        ramax_rounds = 0
-        stack: list[tuple[tree_utils.AlignmentNode, bool]] = [(node, False)]
-        while stack:
-            current, covered = stack.pop()
-            if current.round and (current.round.replace_with_ramax or covered):
-                ramax_rounds += 1
-            subtree_cover = covered or bool(current.round and _is_subtree_mode_round(current.round))
-            for child in current.children:
-                stack.append((child, subtree_cover))
+    def compose(self) -> ComposeResult:
+        tree = _PlanTextualTree(self._label_for(self.root_node), data=self.root_node, id="plan-tree")
+        tree.show_root = True
+        tree.auto_expand = False
+        tree.root.expand()
+        self._tree = tree
+        self._node_to_tree[self.root_node] = tree.root
+        self._populate(tree.root, self.root_node)
+        yield tree
 
-        def _depth(n: tree_utils.AlignmentNode) -> int:
-            if not n.children:
-                return 1
-            return 1 + max(_depth(c) for c in n.children)
+    def on_mount(self) -> None:
+        if self._tree:
+            self._tree.focus()
+            self.call_after_refresh(self._initialize_tree_view)
 
-        def _leaves(n: tree_utils.AlignmentNode) -> int:
-            if not n.children:
-                return 1
-            return sum(_leaves(c) for c in n.children)
+    def _initialize_tree_view(self, *, preserve_focus: bool = False) -> None:
+        if not self._tree:
+            return
+        target = self._focused_node if preserve_focus else self.root_node
+        self._expand_every_tree_node()
+        self._focus_node(target)
+        self._notify("Tree ready. Expanded all nodes. Scope: Subtree.")
 
-        jobstore = None
-        for r in rounds:
-            for step in (r.blast_step, r.align_step):
-                if step and step.jobstore:
-                    jobstore = step.jobstore
-                    break
-            if jobstore:
-                break
-        return {
-            "total_rounds": total_rounds,
-            "ramax_rounds": ramax_rounds,
-            "hal2fasta": hal2fasta,
-            "leaves": _leaves(node),
-            "depth": _depth(node),
-            "jobstore": jobstore,
-        }
+    def _expand_every_tree_node(self) -> None:
+        if self._tree:
+            self._tree.root.expand_all()
 
-    def _render_dashboard(self, node: tree_utils.AlignmentNode) -> Table:
-        # Mode and theme color
-        if node.round:
-            if _is_effective_ramax_node(node):
-                mode_icon = "⚡"
-                mode_name = "RaMAx Accelerated"
-                theme_color = "yellow"
-            else:
-                mode_icon = "🌵"
-                mode_name = "Cactus Classic"
-                theme_color = "cyan"
-            file_type = "HAL"
-            target_file = Path(node.round.target_hal).name
-        else:
-            mode_icon = "🌿"
-            mode_name = "Leaf Genome"
-            theme_color = "green"
-            file_type = "FASTA"
-            target_file = _node_display_name(node)
-
-        base_dir = getattr(self.app, "base_dir", Path.cwd())
-        grid = Table.grid(expand=True, padding=(0, 2))
-        grid.add_column(ratio=1)
-        grid.add_column(ratio=2)
-        grid.add_column(ratio=1)
-
-        # --- Left column: identity card ---
-        id_table = Table.grid(expand=True, padding=(0, 1))
-        id_table.add_column(justify="right", style="dim #6272a4", width=8)
-        id_table.add_column(justify="left", ratio=1)
-
-        # Row 1: Node Name
-        id_table.add_row("Node", Text(f"{mode_icon} {_node_display_name(node)}", style="bold white"))
-        
-        # Row 2: Parent & Length
-        parent_name = _node_display_name(node.parent) if getattr(node, "parent", None) else "None (Root)"
-        length_val = getattr(node, "length", None)
-        length_str = f"{length_val:.4g}" if length_val is not None else "-"
-        
-        meta_info = Text.assemble(
-            (parent_name, "white"),
-            ("  Len: ", "dim #6272a4"),
-            (length_str, "cyan")
-        )
-        id_table.add_row("Parent", meta_info)
-
-        # Row 3: Mode
-        id_table.add_row("Mode", Text(mode_name, style=theme_color))
-        
-        # Output Check
-        out_status = "white"
-        out_info = ""
-        if node.round and node.round.target_hal:
-            out_path = base_dir / node.round.target_hal
-            if out_path.exists():
-                 out_status = "green"
-                 try:
-                     size = out_path.stat().st_size
-                     for unit in ["B", "KB", "MB", "GB", "TB"]:
-                         if size < 1024:
-                             break
-                         size /= 1024
-                     out_info = f" ({size:.1f}{unit})"
-                 except Exception:
-                     out_info = " (Ready)"
-            else:
-                 out_status = "dim white"
-                 out_info = " (Pending)"
-        
-        # Row 4: Output File
-        id_table.add_row("Output", Text(f"{target_file}{out_info}", overflow="ellipsis", style=out_status))
-
-        # Row 5: Workdir / Root
-        if node.round:
-            wd_status = "white"
-            if node.round.workdir:
-                wd_path = base_dir / node.round.workdir
-                if wd_path.exists() and wd_path.is_dir():
-                    wd_status = "green"
-                else:
-                    wd_status = "dim white"
-            workdir_text = node.round.workdir or "N/A"
-            id_table.add_row("Workdir", Text(workdir_text, overflow="ellipsis", style=wd_status))
-            
-            if node.round.manual_ramax_command:
-                id_table.add_row("Custom", Text("Manual Command Set", style="bold yellow"))
-
-        identity_panel = Panel(id_table, title="[Identity]", border_style=f"dim {theme_color}", padding=(0, 1), height=11)
-
-        # --- Middle column: statistics overview ---
-        stats = self._subtree_stats(node)
-        
-        # Get whole-tree statistics
-        total_stats = stats
-        if hasattr(self.app, "alignment_tree") and self.app.alignment_tree:
-             total_stats = self._subtree_stats(self.app.alignment_tree.root)
-
-        def _make_section(title: str, data: dict, color: str) -> RenderableType:
-             cov = (data["ramax_rounds"] / data["total_rounds"]) if data["total_rounds"] else 0.0
-             # Dynamically adjust progress-bar width
-             mid_width = max(20, self.size.width // 3)
-             bar_w = max(6, min(15, mid_width - 22))
-             
-             bar = self._metric_bar(cov * 100, bar_width=bar_w, accent=color)
-             cov_txt = f"{data['ramax_rounds']}/{data['total_rounds']}"
-             
-             # First line: title + progress bar + value
-             header = Table.grid(expand=True, padding=(0, 1))
-             header.add_column(style=f"bold {color}", width=8)
-             header.add_column()
-             header.add_column(justify="right", width=len(cov_txt))
-             header.add_row(title, bar, Text(cov_txt, style="white"))
-             
-             # Second line: detail metrics
-             details = Text.assemble(
-                 ("Leaves: ", "dim #6272a4"), (str(data['leaves']), "white"), "  ",
-                 ("Depth: ", "dim #6272a4"), (str(data['depth']), "white"), "  ",
-                 ("H2F: ", "dim #6272a4"), (str(data['hal2fasta']), "white")
-             )
-             return Group(header, details)
-
-        sub_group = _make_section("Subtree", stats, "yellow")
-        tot_group = _make_section("Total", total_stats, "cyan")
-        
-        # Combine sections with an empty line in between
-        content = Group(sub_group, Text(" "), tot_group)
-        
-        config_panel = Panel(content, title="[Statistics]", border_style="dim white", padding=(0, 1), height=11)
-
-        # Right column: live system metrics
-        metrics_panel = self._render_metrics_panel()
-
-        grid.add_row(identity_panel, config_panel, metrics_panel)
-        return grid
-
-    def _render_metrics_panel(self) -> Panel:
-        metrics = self._metrics or {}
-        cpu_percent = metrics.get("cpu_percent")
-        mem = metrics.get("mem")
-        gpus = metrics.get("gpus")
-        disk = metrics.get("disk")
-        spinner = next(self._spinner)
-
-        # Adjust bar width to work on narrow terminals.
-        right_width = max(30, self.size.width // 3)
-        bar_width = max(10, min(30, right_width - 10))
-
-        blocks: list[RenderableType] = []
-
-        blocks.append(
-            self._metric_block("CPU", cpu_percent, f"{cpu_percent:.0f}%" if isinstance(cpu_percent, (int, float)) else "-", "cyan", bar_width)
-        )
-
-        if isinstance(mem, dict):
-            m_percent = mem.get("percent", 0.0)
-            used = mem.get("used_gb")
-            total = mem.get("total_gb")
-            usage = f"{used:.1f}/{total:.1f} GB" if used is not None and total is not None else ""
-            blocks.append(
-                self._metric_block("Memory", m_percent, f"{m_percent:.0f}% {usage}".strip(), "green", bar_width)
-            )
-        else:
-            blocks.append(self._metric_block("Memory", None, "N/A", "green", bar_width))
-
-        if isinstance(gpus, list) and gpus:
-            gpu = gpus[0]
-            g_util = gpu.get("util", 0.0)
-            g_mem_percent = gpu.get("mem_percent", 0.0)
-            g_mem = f"{gpu.get('mem_used', 0):.1f}/{gpu.get('mem_total', 0):.1f} GB"
-            detail = f"{g_util:.0f}% {g_mem} ({g_mem_percent:.0f}%)"
-            blocks.append(self._metric_block("GPU", g_util, detail, "yellow", bar_width))
-        else:
-            blocks.append(self._metric_block("GPU", None, "Not detected", "yellow", bar_width))
-
-        if isinstance(disk, dict):
-            d_percent = disk.get("percent", 0.0)
-            d_text = f"{d_percent:.0f}% {disk.get('used_gb', 0):.1f}/{disk.get('total_gb', 0):.1f} GB"
-            blocks.append(self._metric_block("Disk", d_percent, d_text, "magenta", bar_width))
-
-        table = Table.grid(padding=(0, 0), expand=True)
-        table.add_column(ratio=1)
-        for block in blocks:
-            table.add_row(block)
-
-        title = Text.assemble(
-            ("[Live] ", "dim"),
-            ("System resources ", "white"),
-            (spinner, "cyan"),
-        )
-        return Panel(table, title=title, border_style="bright_blue", padding=(0, 1), height=11)
-
-    def _bar_color(self, percent: float) -> str:
-        if percent >= 85:
-            return "red"
-        if percent >= 60:
-            return "yellow"
-        return "green"
-
-    def _metric_bar(self, percent: float | None, bar_width: int = 22, accent: str = "green") -> Text:
-        if percent is None:
-            return Text("N/A", style="dim")
-        pct = max(0.0, min(100.0, float(percent)))
-        return self._draw_bar(pct / 100.0, width=bar_width, color=self._bar_color(pct))
-
-    def _metric_block(
+    def set_detail_callback(
         self,
-        label: str,
-        percent: float | None,
-        detail: str,
-        accent: str,
-        bar_width: int,
+        callback: Optional[Callable[[tree_utils.AlignmentNode, Optional[str]], None]],
+    ) -> None:
+        self._detail_callback.handler = callback
+
+    def current_node(self) -> tree_utils.AlignmentNode:
+        return self._focused_node
+
+    def current_scope(self) -> str:
+        return self.scope
+
+    def rebuild_labels(self) -> None:
+        for node, tree_node in self._node_to_tree.items():
+            tree_node.set_label(self._label_for(node))
+        if self._tree:
+            self._tree.refresh()
+
+    def _populate(
+        self,
+        tree_node: TreeNode[tree_utils.AlignmentNode],
+        alignment_node: tree_utils.AlignmentNode,
+    ) -> None:
+        for child in alignment_node.children:
+            allow_expand = bool(child.children)
+            child_tree = tree_node.add(
+                self._label_for(child),
+                data=child,
+                expand=True,
+                allow_expand=allow_expand,
+            )
+            self._node_to_tree[child] = child_tree
+            self._populate(child_tree, child)
+
+    def _label_for(self, node: tree_utils.AlignmentNode) -> Text:
+        kind = self._node_kind(node)
+        marker = {"ramax": "R", "cactus": "C", "covered": "R*", "clade": "◇", "leaf": "L"}[kind]
+        style = {
+            "ramax": "bold #f59e0b",
+            "covered": "bold #fbbf24",
+            "cactus": "bold #22d3ee",
+            "clade": "dim #7dd3fc",
+            "leaf": "#86efac",
+        }[kind]
+        label = Text()
+        label.append(f"{marker} ", style=style)
+        label.append(_node_display_name(node), style=style)
+        if node.round and node.round.mash_distance is not None:
+            label.append(f" mash {node.round.mash_distance:.4f}", style="dim #94a3b8")
+        if node.round and _is_subtree_mode_round(node.round):
+            label.append(" subtree", style="dim #fbbf24")
+        return label
+
+    def _node_kind(self, node: tree_utils.AlignmentNode) -> str:
+        if node.round:
+            if node.round.replace_with_ramax:
+                return "ramax"
+            if _is_effective_ramax_node(node):
+                return "covered"
+            return "cactus"
+        if node.children:
+            return "clade"
+        return "leaf"
+
+    def _is_actionable_node(self, node: tree_utils.AlignmentNode) -> bool:
+        return bool(node.round or node.children)
+
+    def _visible_nodes(self) -> list[tree_utils.AlignmentNode]:
+        if not self._tree:
+            return []
+        visible: list[tree_utils.AlignmentNode] = []
+
+        def walk(tree_node: TreeNode[tree_utils.AlignmentNode]) -> None:
+            node = tree_node.data
+            if isinstance(node, tree_utils.AlignmentNode):
+                visible.append(node)
+            if not tree_node.is_expanded:
+                return
+            for child in tree_node.children:
+                walk(child)
+
+        walk(self._tree.root)
+        return visible
+
+    def _move_focus(self, delta: int) -> None:
+        visible = self._visible_nodes()
+        if not visible:
+            return
+        try:
+            start = visible.index(self._focused_node)
+        except ValueError:
+            start = 0
+        index = start + delta
+        while 0 <= index < len(visible):
+            node = visible[index]
+            if self._is_actionable_node(node):
+                self._focus_node(node)
+                self._notify()
+                return
+            index += delta
+
+    def _sync_focused_tree_node(self, tree_node: TreeNode[tree_utils.AlignmentNode]) -> None:
+        node = tree_node.data
+        if isinstance(node, tree_utils.AlignmentNode):
+            self._focused_node = node
+            if self._tree:
+                self._tree.scroll_to_node(tree_node, animate=False)
+            self._notify()
+
+    def on_tree_node_highlighted(self, event: TextualTree.NodeHighlighted) -> None:
+        node = event.node.data
+        if isinstance(node, tree_utils.AlignmentNode):
+            self._sync_focused_tree_node(event.node)
+
+    def on_tree_node_selected(self, event: TextualTree.NodeSelected) -> None:
+        node = event.node.data
+        if isinstance(node, tree_utils.AlignmentNode):
+            self._sync_focused_tree_node(event.node)
+
+    def action_toggle_scope(self) -> None:
+        self.scope = "node" if self.scope == "subtree" else "subtree"
+        self._notify(f"Scope switched to: {'Single node' if self.scope == 'node' else 'Subtree'}")
+
+    def action_toggle_apply(self) -> None:
+        if self.scope == "node":
+            self._toggle_single()
+        else:
+            self._toggle_subtree()
+
+    def _toggle_single(self) -> None:
+        node = self._focused_node
+        if not node.round:
+            self._notify("No round on this node; nothing to toggle.")
+            return
+        if self._maybe_revert_subtree_ancestor(node):
+            return
+        if SUBTREE_MODE_FLAG in node.round.ramax_opts:
+            node.round.ramax_opts.remove(SUBTREE_MODE_FLAG)
+        node.round.replace_with_ramax = not node.round.replace_with_ramax
+        self.rebuild_labels()
+        state = "RaMAx" if node.round.replace_with_ramax else "Cactus"
+        self._notify(f"Current node switched to {state}.")
+
+    def _toggle_subtree(self) -> None:
+        node = self._focused_node
+        if not node.round:
+            self._notify("No round on this node to apply subtree mode.")
+            return
+        active = _is_subtree_mode_round(node.round)
+        if active:
+            node.round.replace_with_ramax = False
+            if SUBTREE_MODE_FLAG in node.round.ramax_opts:
+                node.round.ramax_opts.remove(SUBTREE_MODE_FLAG)
+            message = "Disabled subtree RaMAx."
+        else:
+            node.round.replace_with_ramax = True
+            if SUBTREE_MODE_FLAG not in node.round.ramax_opts:
+                node.round.ramax_opts.append(SUBTREE_MODE_FLAG)
+            disabled = 0
+            for child in self._collect_round_nodes(node):
+                if child is node:
+                    continue
+                if child.round and child.round.replace_with_ramax:
+                    child.round.replace_with_ramax = False
+                    if SUBTREE_MODE_FLAG in child.round.ramax_opts:
+                        child.round.ramax_opts.remove(SUBTREE_MODE_FLAG)
+                    disabled += 1
+            message = f"Enabled subtree RaMAx. Overridden {disabled} descendant(s)."
+        self.rebuild_labels()
+        self._notify(message)
+
+    def _maybe_revert_subtree_ancestor(self, node: tree_utils.AlignmentNode) -> bool:
+        current = getattr(node, "parent", None)
+        while current:
+            if current.round and _is_subtree_mode_round(current.round):
+                current.round.replace_with_ramax = False
+                current.round.ramax_opts.remove(SUBTREE_MODE_FLAG)
+                self.rebuild_labels()
+                self._notify(
+                    f"Ancestor subtree mode on '{_node_display_name(current)}' was disabled before node-level edit."
+                )
+                return True
+            current = getattr(current, "parent", None)
+        return False
+
+    def _collect_round_nodes(self, node: tree_utils.AlignmentNode) -> list[tree_utils.AlignmentNode]:
+        return [candidate for candidate in node.walk() if candidate.round]
+
+    def action_open_search(self) -> None:
+        self.app.push_screen(SearchModal(self._search_term or ""), self._apply_search_term)
+
+    def _apply_search_term(self, term: str | None) -> None:
+        if term is None:
+            return
+        cleaned = term.strip().lower()
+        if not cleaned:
+            self._search_term = None
+            self._hits = []
+            self._notify("Search cleared.")
+            return
+        self._search_term = cleaned
+        self._hits = [node for node in self.root_node.walk() if cleaned in _node_search_text(node)]
+        self._hit_index = 0
+        if not self._hits:
+            self._notify("No matching nodes found.")
+            return
+        self._focus_node(self._hits[0])
+        self._notify(f"Found {len(self._hits)} match(es).")
+
+    def action_search_next(self) -> None:
+        self._jump_hit(+1)
+
+    def action_search_prev(self) -> None:
+        self._jump_hit(-1)
+
+    def _jump_hit(self, delta: int) -> None:
+        if not self._hits:
+            return
+        self._hit_index = (self._hit_index + delta) % len(self._hits)
+        self._focus_node(self._hits[self._hit_index])
+        self._notify(f"Match {self._hit_index + 1}/{len(self._hits)}.")
+
+    def _focus_node(self, node: tree_utils.AlignmentNode) -> None:
+        self._focused_node = node
+        tree_node = self._node_to_tree.get(node)
+        if not self._tree or not tree_node:
+            return
+        current = tree_node.parent
+        while current:
+            current.expand()
+            current = current.parent
+        self._tree.move_cursor(tree_node, animate=False)
+        self._tree.scroll_to_node(tree_node, animate=False)
+
+    def _sync_focused_from_tree_cursor(self) -> None:
+        if not self._tree or not self._tree.cursor_node:
+            return
+        node = self._tree.cursor_node.data
+        if isinstance(node, tree_utils.AlignmentNode):
+            self._focused_node = node
+            self._notify()
+
+    def action_toggle_fold(self) -> None:
+        tree_node = self._node_to_tree.get(self._focused_node)
+        if not tree_node or not tree_node.allow_expand:
+            self._notify("Current node has no child branch to fold.")
+            return
+        if tree_node.is_expanded:
+            tree_node.collapse()
+            self._notify("Folded current branch.")
+        else:
+            tree_node.expand()
+            self._notify("Opened current branch.")
+
+    def action_cursor_down(self) -> None:
+        self._move_focus(+1)
+
+    def action_cursor_up(self) -> None:
+        self._move_focus(-1)
+
+    def action_cursor_left(self) -> None:
+        if not self._tree:
+            return
+        self._tree.action_cursor_parent()
+        self._sync_focused_from_tree_cursor()
+
+    def action_cursor_right(self) -> None:
+        if not self._tree:
+            return
+        tree_node = self._node_to_tree.get(self._focused_node)
+        if tree_node and tree_node.allow_expand and not tree_node.is_expanded:
+            tree_node.expand()
+            self._notify("Expanded current subtree.")
+            return
+        if tree_node and tree_node.children:
+            child = next(
+                (
+                    candidate
+                    for candidate in tree_node.children
+                    if isinstance(candidate.data, tree_utils.AlignmentNode)
+                    and self._is_actionable_node(candidate.data)
+                ),
+                None,
+            )
+            if child and isinstance(child.data, tree_utils.AlignmentNode):
+                self._focus_node(child.data)
+                self._notify()
+
+    def action_edit_round(self) -> None:
+        self.app.action_edit_round()
+
+    def _notify(self, status: Optional[str] = None) -> None:
+        self._detail_callback(self._focused_node, status=status)
+
+
+class DecisionPanel(Static):
+    """Right-side decision panel for the focused tree node."""
+
+    DEFAULT_CSS = """
+    DecisionPanel {
+        height: 1fr;
+        width: 1fr;
+        min-height: 0;
+        overflow-y: auto;
+        padding: 1 2;
+        border-left: solid #30363d;
+    }
+    """
+
+    def update_node(
+        self,
+        node: tree_utils.AlignmentNode,
+        *,
+        scope: str,
+        run_settings: RunSettings,
+        status: str | None = None,
+    ) -> None:
+        self.update(self._render_decision(node, scope=scope, run_settings=run_settings, status=status))
+
+    def _render_decision(
+        self,
+        node: tree_utils.AlignmentNode,
+        *,
+        scope: str,
+        run_settings: RunSettings,
+        status: str | None,
     ) -> RenderableType:
-        title = Text(label, style=f"bold {accent}")
-        bar = self._metric_bar(percent, bar_width=bar_width, accent=accent)
-        value = Text(detail, style="white")
-        bar_line = Text.assemble(bar, "  ", value, no_wrap=True)
-        return Group(title, bar_line)
+        header = Text("Decision", style="bold cyan")
+        title = Text.assemble(("Node: ", "dim"), (_node_display_name(node), "bold white"))
+        scope_text = "Single node" if scope == "node" else "Subtree"
+        body = Table.grid(expand=True, padding=(0, 1))
+        body.add_column(ratio=1)
+        body.add_column(ratio=2)
+        body.add_row("Scope", Text(scope_text, style="bold yellow" if scope == "subtree" else "bold cyan"))
+        if node.round:
+            mode = "RaMAx" if node.round.replace_with_ramax else "Cactus"
+            if _is_effective_ramax_node(node) and not node.round.replace_with_ramax:
+                mode = "RaMAx (covered by ancestor subtree)"
+            body.add_row("Decision", Text(mode, style="bold green" if "RaMAx" in mode else "bold cyan"))
+            body.add_row("Round", node.round.name)
+            if node.round.mash_distance is not None:
+                mash = f"{node.round.mash_distance:.4f}"
+                if node.round.mash_source and node.round.mash_source != node.round.root:
+                    mash += f" @ {node.round.mash_source}"
+                body.add_row("Mash", mash)
+                body.add_row("Threshold", f"{run_settings.mash_distance_threshold:.4f}")
+            else:
+                body.add_row("Mash", "(not computed)")
+            subtree_rounds = list(node.iter_rounds())
+        else:
+            body.add_row("Decision", "No round on this node")
+            subtree_rounds = list(node.iter_rounds())
+        if subtree_rounds:
+            subtree_nodes = [candidate for candidate in node.walk() if candidate.round]
+            effective = sum(1 for candidate in subtree_nodes if _is_effective_ramax_node(candidate))
+            body.add_row("Rounds", f"{effective}/{len(subtree_rounds)} RaMAx")
+        parts: list[RenderableType] = [header, title, Text(""), body]
+        if status:
+            parts.insert(2, Text(status, style="green"))
+        return Group(*parts)
 
-    def _metric_text(self, percent: float | None, suffix: str = "") -> Text:
-        if percent is None:
-            return Text("-", style="dim")
-        return Text(f"{percent:4.0f}{suffix}", style="white")
-
-    def _collect_metrics(self) -> dict[str, object]:
-        data: dict[str, object] = {}
-        try:
-            cpu_percent = psutil.cpu_percent(interval=None)
-            data["cpu_percent"] = cpu_percent
-        except Exception:
-            pass
-
-        try:
-            mem = psutil.virtual_memory()
-            data["mem"] = {
-                "percent": mem.percent,
-                "used_gb": mem.used / (1024**3),
-                "total_gb": mem.total / (1024**3),
-            }
-        except Exception:
-            pass
-
-        try:
-            disk = psutil.disk_usage(Path.cwd())
-            data["disk"] = {
-                "percent": disk.percent,
-                "used_gb": disk.used / (1024**3),
-                "total_gb": disk.total / (1024**3),
-            }
-        except Exception:
-            pass
-
-        gpu_stats = self._collect_gpu_metrics()
-        if gpu_stats:
-            data["gpus"] = gpu_stats
-        return data
-
-    def _collect_gpu_metrics(self) -> list[dict[str, float]] | None:
-        if self._gpu_disabled:
-            return None
-        if shutil.which("nvidia-smi") is None:
-            self._gpu_disabled = True
-            return None
-        try:
-            result = subprocess.run(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=utilization.gpu,memory.used,memory.total",
-                    "--format=csv,noheader,nounits",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=0.3,
-                check=True,
-            )
-        except (subprocess.SubprocessError, FileNotFoundError):
-            self._gpu_disabled = True
-            return None
-
-        gpus: list[dict[str, float]] = []
-        for line in result.stdout.splitlines():
-            if not line.strip():
-                continue
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 3:
-                continue
-            try:
-                util = float(parts[0])
-                mem_used = float(parts[1])
-                mem_total = float(parts[2])
-            except ValueError:
-                continue
-            mem_percent = (mem_used / mem_total * 100) if mem_total else 0.0
-            gpus.append(
-                {
-                    "util": util,
-                    "mem_used": mem_used / 1024 if mem_used else 0.0,
-                    "mem_total": mem_total / 1024 if mem_total else 0.0,
-                    "mem_percent": mem_percent,
-                }
-            )
-
-        if not gpus:
-            self._gpu_disabled = True
-            return None
-        return gpus
 
 class RunSettingsScreen(Screen[RunSettings | None]):
-    """Dedicated screen for confirming run-time configuration."""
+    """Keyboard-first confirmation screen for starting execution."""
 
     BINDINGS = [
         Binding("escape", "cancel", "Back"),
-        Binding("ctrl+enter", "save", "Run"),
-        Binding("ctrl+r", "save", "Run"),
+        Binding("enter", "activate_selected", "Select"),
+        Binding("r", "save", "Run"),
+        Binding("e", "edit_commands", "Edit commands"),
+        Binding("s", "save_commands", "Save commands"),
         Binding("v", "toggle_verbose", "Toggle verbose"),
-        Binding("f6", "toggle_view", "View"),
+        Binding("space", "toggle_selected", "Toggle field"),
+        Binding("up", "field_up", show=False),
+        Binding("down", "field_down", show=False),
+        Binding("k", "field_up", show=False),
+        Binding("j", "field_down", show=False),
+        Binding("left", "decrement_threads", show=False),
+        Binding("right", "increment_threads", show=False),
+        Binding("f6", "toggle_view", "Commands"),
     ]
 
     CSS = """
-    RunSettingsScreen > .screen {
-        layout: vertical;
-    }
     #run-root {
         padding: 1 2;
         height: 1fr;
@@ -1680,57 +1245,18 @@ class RunSettingsScreen(Screen[RunSettings | None]):
         layout: vertical;
         min-height: 0;
     }
-    #run-title {
-        padding-bottom: 1;
-    }
-    #run-body {
-        layout: horizontal;
-        min-height: 0;
-    }
-    #run-summary {
-        width: 60%;
-        min-width: 40;
-        margin-right: 2;
+    #run-scroll {
         height: 1fr;
+        min-height: 0;
         overflow-y: auto;
     }
-    #run-form {
-        width: 40%;
-        min-width: 32;
-        height: 1fr;
-        border: round $accent;
-        padding: 1;
-        background: $panel;
-        layout: vertical;
-    }
-    #run-instructions {
-        color: $text-muted;
-        padding-bottom: 1;
-    }
-    #run-verbose {
-        margin-bottom: 1;
-    }
-    #run-threads {
-        width: 100%;
-    }
-    #run-hint {
-        padding-top: 1;
-        color: $text-muted;
-    }
     #run-status {
-        padding-top: 1;
-        color: $error;
-    }
-    #run-buttons {
-        padding-top: 1;
-        layout: horizontal;
-        content-align: right middle;
-    }
-    #run-buttons Button {
-        margin-left: 1;
-    }
-    #run-buttons Button:first-child {
-        margin-left: 0;
+        dock: bottom;
+        height: 1;
+        width: 100%;
+        background: $panel;
+        padding: 0 1;
+        color: $text;
     }
     """
 
@@ -1746,55 +1272,58 @@ class RunSettingsScreen(Screen[RunSettings | None]):
         self.current = current
         self.compact = compact
         self.resume_available = resume_available
-        self._summary: Static | None = None
-        self._input: Input | None = None
-        self._verbose: Checkbox | None = None
+        self._content: Static | None = None
         self._status: Static | None = None
-        self._view_mode: str = "resume" if (resume_available and current.resume) else "flow"  # resume | flow | table
+        self._view_mode: str = "summary"
+        self._field_index = 0
+        self._thread_text = "" if current.thread_count is None else str(current.thread_count)
+        self._verbose_enabled = current.verbose
+        self._resume_enabled = current.resume
+        self._previous_sub_title: str | None = None
+        self._leaving_for_run = False
+        self._command_cache: dict[Optional[int], list[PlannedCommand]] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Container(id="run-root"):
-            yield Static("Plan is ready. Review run settings before execution:", id="run-title")
-            with Container(id="run-body"):
-                summary = Static(id="run-summary")
-                self._summary = summary
-                summary.update(self._render_summary(self.current))
-                yield summary
-                with Container(id="run-form"):
-                    yield Static("• Tab/Shift+Tab to move between controls\n• Ctrl+Enter to run immediately\n• V toggles verbose logging\n• F6 toggles overview view", id="run-instructions")
-                    verbose_box = Checkbox(
-                        "Verbose logging (stream every command output)",
-                        value=self.current.verbose,
-                        id="run-verbose",
-                    )
-                    self._verbose = verbose_box
-                    yield verbose_box
-                    threads_input = Input(
-                        value="" if self.current.thread_count is None else str(self.current.thread_count),
-                        placeholder="Leave blank to keep each command's thread defaults",
-                        id="run-threads",
-                    )
-                    self._input = threads_input
-                    yield threads_input
-                    yield Static("Threads propagate to cactus --maxCores and RaMAx --threads.", id="run-hint")
-                    status = Static("", id="run-status")
-                    self._status = status
-                    yield status
-                    with Container(id="run-buttons"):
-                        yield Button("Save command list", id="run-save")
-                        yield Button("Run plan (Ctrl+Enter)", id="run-confirm", variant="success")
-                        yield Button("Back to plan (Esc)", id="run-cancel")
-        yield Footer()
+            with VerticalScroll(id="run-scroll"):
+                content = Static(id="run-content")
+                self._content = content
+                yield content
+        status = Static("", id="run-status")
+        self._status = status
+        yield status
 
     def on_mount(self) -> None:
-        if self._input:
-            self.set_focus(self._input)
+        self._previous_sub_title = getattr(self.app, "sub_title", None)
+        if hasattr(self.app, "sub_title"):
+            self.app.sub_title = "Run settings"
+        self._refresh()
+
+    def on_unmount(self) -> None:
+        if not self._leaving_for_run and self._previous_sub_title and hasattr(self.app, "sub_title"):
+            self.app.sub_title = self._previous_sub_title
+
+    def on_key(self, event: events.Key) -> None:
+        if self._current_item_id() != "threads":
+            return
+        if event.character and event.character.isdigit():
+            event.prevent_default()
+            self._thread_text = (self._thread_text + event.character).lstrip("0") or "0"
+            self._refresh()
+            return
+        if event.key == "backspace":
+            event.prevent_default()
+            self._thread_text = self._thread_text[:-1]
+            self._refresh()
+            return
+        if event.character and event.character.lower() == "a":
+            event.prevent_default()
+            self._thread_text = ""
+            self._refresh("Threads set to auto.")
 
     def _validate_threads(self) -> tuple[bool, Optional[int], Optional[str]]:
-        if not self._input:
-            return True, None, None
-        text = self._input.value.strip()
+        text = self._thread_text.strip()
         if not text:
             return True, None, None
         try:
@@ -1805,237 +1334,332 @@ class RunSettingsScreen(Screen[RunSettings | None]):
             return False, None, "Thread count must be at least 1."
         return True, value, None
 
-    def _update_status(self, message: str | None) -> None:
+    def _refresh(self, message: str | None = None) -> None:
+        if self._content is not None:
+            self._content.update(self._render_run_content())
+        self._update_status(message)
+
+    def _update_status(self, message: str | None = None) -> None:
         if self._status is not None:
-            self._status.update(message or "")
+            if message:
+                self._status.update(message)
+                return
+            if self._view_mode == "commands":
+                self._status.update("Enter/R run | E edit | S save list | F6 summary | Esc back")
+            else:
+                self._status.update("Enter selected | R run | E edit | V verbose | S save | F6 preview | Esc back")
 
     def action_save(self) -> None:
         ok, threads, error = self._validate_threads()
         if not ok:
-            self._update_status(error)
+            self._refresh(error)
             return
-        self._update_status("")
         settings = self._current_settings_preview()
-        # 替换线程数为已校验的值，避免在预览中使用旧值
         settings.thread_count = threads
+        self._leaving_for_run = True
         self.dismiss(settings)
 
     def action_cancel(self) -> None:
+        if self._view_mode == "commands":
+            self._view_mode = "summary"
+            self._refresh("Run summary.")
+            return
         self.dismiss(None)
 
-    def action_toggle_verbose(self) -> None:
-        if self._verbose:
-            self._verbose.value = not self._verbose.value
-            self._refresh_summary()
-
-    def action_toggle_view(self) -> None:
-        # 切换左侧总览的呈现方式：有续跑状态时支持 resume/flow/table 三态，否则保持 flow/table 二态。
-        if self.resume_available:
-            modes = ("resume", "flow", "table")
-            try:
-                idx = modes.index(self._view_mode)
-            except ValueError:
-                idx = 0
-            self._view_mode = modes[(idx + 1) % len(modes)]
-        else:
-            self._view_mode = "table" if self._view_mode == "flow" else "flow"
-        self._refresh_summary()
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "run-threads":
-            self.action_save()
-
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id == "run-threads":
-            self._refresh_summary()
-
-    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
-        if event.checkbox.id == "run-verbose":
-            self._refresh_summary()
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "run-save":
-            self._handle_save_commands()
-        elif event.button.id == "run-confirm":
-            self.action_save()
-        elif event.button.id == "run-cancel":
-            self.action_cancel()
-
-    def _handle_save_commands(self) -> None:
+    def action_save_commands(self) -> None:
+        ok, _, error = self._validate_threads()
+        if not ok:
+            self._refresh(error)
+            return
         app = self.app
         if not isinstance(app, PlanUIApp):
-            self._update_status("Cannot save commands: unknown host app")
+            self._refresh("Cannot save commands from this host.")
             return
-        settings = self._current_settings_preview()
-        path = app.export_commands(settings, notify_detail=False)
-        if path:
-            path_str = str(path)
-            self._update_status(f"Commands saved to {path_str}")
+        path = app.export_commands(self._current_settings_preview(), notify_detail=False)
+        self._refresh(f"Commands saved to {path}" if path else "Failed to save commands.")
+
+    def action_edit_commands(self) -> None:
+        app = self.app
+        if not isinstance(app, PlanUIApp):
+            self._refresh("Cannot edit commands from this host.")
+            return
+        if not self.plan.rounds:
+            self._refresh("No rounds found in this plan.")
+            return
+        picker = RoundPickerModal(self.plan.rounds)
+        app.push_screen(picker, self._handle_edit_round_pick)
+
+    def _handle_edit_round_pick(self, index: int | None) -> None:
+        if index is None:
+            self._refresh("Edit cancelled.")
+            return
+        app = self.app
+        if not isinstance(app, PlanUIApp) or index >= len(self.plan.rounds):
+            self._refresh("Cannot edit this round.")
+            return
+        app._start_round_edit(index, on_done=self._handle_command_edited)
+
+    def _handle_command_edited(self) -> None:
+        self._command_cache.clear()
+        self._refresh("Command updated.")
+
+    def action_toggle_verbose(self) -> None:
+        self._verbose_enabled = not self._verbose_enabled
+        self._refresh(f"Verbose logging {'on' if self._verbose_enabled else 'off'}.")
+
+    def action_toggle_view(self) -> None:
+        self._view_mode = "commands" if self._view_mode == "summary" else "summary"
+        self._refresh("Command preview." if self._view_mode == "commands" else "Run summary.")
+
+    def action_field_up(self) -> None:
+        items = self._items()
+        self._field_index = (self._field_index - 1) % len(items)
+        self._refresh()
+
+    def action_field_down(self) -> None:
+        items = self._items()
+        self._field_index = (self._field_index + 1) % len(items)
+        self._refresh()
+
+    def action_activate_selected(self) -> None:
+        if self._view_mode == "commands":
+            self.action_save()
+            return
+        item = self._current_item_id()
+        if item == "run":
+            self.action_save()
+            return
+        if item == "edit":
+            self.action_edit_commands()
+            return
+        if item == "preview":
+            self.action_toggle_view()
+            return
+        if item == "save_commands":
+            self.action_save_commands()
+            return
+        self.action_toggle_selected()
+
+    def action_toggle_selected(self) -> None:
+        item = self._current_item_id()
+        if item == "threads":
+            self.action_edit_threads()
+            return
+        if item == "verbose":
+            self.action_toggle_verbose()
+            return
+        if item == "resume":
+            self._resume_enabled = not self._resume_enabled
+            self._refresh(f"Resume {'on' if self._resume_enabled else 'off'}.")
+
+    def action_increment_threads(self) -> None:
+        if self._current_item_id() != "threads":
+            return
+        ok, threads, _ = self._validate_threads()
+        next_value = (threads or 0) + 1 if ok else 1
+        self._thread_text = str(next_value)
+        self._refresh()
+
+    def action_decrement_threads(self) -> None:
+        if self._current_item_id() != "threads":
+            return
+        ok, threads, _ = self._validate_threads()
+        if not ok or threads is None or threads <= 1:
+            self._thread_text = ""
         else:
-            self._update_status("Failed to save commands")
+            self._thread_text = str(threads - 1)
+        self._refresh()
+
+    def action_edit_threads(self) -> None:
+        ok, threads, _ = self._validate_threads()
+        current = threads if ok else None
+        self.app.push_screen(ThreadCountModal(current), self._handle_thread_count)
+
+    def _handle_thread_count(self, result: int | str | None) -> None:
+        if result is None:
+            self._refresh("Thread edit cancelled.")
+            return
+        if result == THREAD_AUTO:
+            self._thread_text = ""
+            self._refresh("Threads set to auto.")
+            return
+        self._thread_text = str(result)
+        self._refresh(f"Threads set to {result}.")
+
+    def _items(self) -> list[tuple[str, str, str, str, str]]:
+        settings = self._current_settings_preview()
+        command_count = len(self._commands(settings))
+        items = [
+            (
+                "run",
+                "Run plan",
+                "Enter/R",
+                "action",
+                "Start with the settings below.",
+            ),
+            (
+                "edit",
+                "Edit commands",
+                "E",
+                "action",
+                "Choose a round and edit its command.",
+            ),
+            (
+                "preview",
+                "Command preview",
+                f"F6 / {command_count}",
+                "action",
+                "Open the generated command list.",
+            ),
+            (
+                "save_commands",
+                "Save command list",
+                "S",
+                "action",
+                "Write ramax_commands.txt without running.",
+            ),
+            (
+                "threads",
+                "Threads",
+                "auto" if settings.thread_count is None else str(settings.thread_count),
+                "setting",
+                "Enter/Space edits; blank or auto keeps command defaults.",
+            ),
+            (
+                "verbose",
+                "Verbose",
+                "on" if self._verbose_enabled else "off",
+                "setting",
+                "Streams every command output into the execution log.",
+            ),
+        ]
+        if self.resume_available:
+            items.append(
+                (
+                    "resume",
+                    "Resume",
+                    "on" if self._resume_enabled else "off",
+                    "setting",
+                    "Skips the already completed contiguous command prefix when possible.",
+                )
+            )
+        if self._field_index >= len(items):
+            self._field_index = len(items) - 1
+        return items
+
+    def _fields(self) -> list[tuple[str, str, str, str]]:
+        return [(item_id, label, value, help_text) for item_id, label, value, _, help_text in self._items()]
+
+    def _current_item_id(self) -> str:
+        return self._items()[self._field_index][0]
+
+    def _current_field_id(self) -> str:
+        return self._current_item_id()
 
     def _current_settings_preview(self) -> RunSettings:
-        verbose = self._verbose.value if self._verbose else self.current.verbose
         ok, threads, _ = self._validate_threads()
         thread_val = threads if ok else self.current.thread_count
         return RunSettings(
-            verbose=verbose,
+            verbose=self._verbose_enabled,
             thread_count=thread_val,
-            resume=self.current.resume,
+            resume=self._resume_enabled,
             mash_auto=self.current.mash_auto,
             mash_distance_threshold=self.current.mash_distance_threshold,
         )
 
-    def _refresh_summary(self) -> None:
-        if not self._summary:
-            return
+    def _render_run_content(self) -> RenderableType:
         settings = self._current_settings_preview()
-        self._summary.update(self._render_summary(settings))
+        if self._view_mode == "commands":
+            return self._render_commands(settings)
+        return self._render_summary(settings)
 
     def _render_summary(self, settings: RunSettings) -> RenderableType:
-        if self._view_mode == "resume":
-            return self._render_resume_overview(settings)
-        if self._view_mode == "flow":
-            return self._render_flow_overview(settings)
-        return plan_overview(self.plan, run_settings=settings, compact=self.compact)
+        commands = self._commands(settings)
+        ramax_rounds = sum(1 for round_entry in self.plan.rounds if round_entry.replace_with_ramax)
+        cactus_rounds = len(self.plan.rounds) - ramax_rounds
+        text = Text()
+        text.append("Ready to run\n", style="bold cyan")
+        text.append("Enter runs now. Use E to edit commands first.\n\n", style="dim")
+        text.append(f"Steps: {len(commands)}", style="bold white")
+        text.append(f"    Rounds: {len(self.plan.rounds)}", style="bold white")
+        text.append(f"    RaMAx: {ramax_rounds}", style="bold #f59e0b")
+        text.append(f"    Cactus: {cactus_rounds}\n", style="bold #22d3ee")
+        preview_width = self._preview_width()
+        text.append("Output: ", style="dim")
+        text.append(f"{self._shorten(self.plan.out_dir or '-', preview_width)}\n")
+        text.append("outSeqFile: ", style="dim")
+        text.append(f"{self._shorten(self.plan.out_seq_file or '-', preview_width)}\n")
+        jobstore = self._first_jobstore()
+        if jobstore:
+            text.append("JobStore: ", style="dim")
+            text.append(f"{self._shorten(jobstore, preview_width)}\n")
+        if self.resume_available:
+            text.append("Resume state: ", style="dim")
+            text.append("available\n" if self._resume_enabled else "available, disabled\n")
 
-    def _render_resume_overview(self, settings: RunSettings) -> RenderableType:
+        current_section: str | None = None
+        for item_id, label, value, section, help_text in self._items():
+            if section != current_section:
+                current_section = section
+                heading = "\nActions\n" if section == "action" else "\nSettings\n"
+                text.append(heading, style="bold cyan")
+            selected = item_id == self._current_item_id()
+            prefix = "> " if selected else "  "
+            row_style = RUN_SELECTED_STYLE if selected else RUN_ITEM_STYLE
+            value_style = RUN_SELECTED_STYLE if selected else RUN_VALUE_STYLE
+            text.append(prefix, style=row_style)
+            text.append(label, style=row_style)
+            text.append("  ", style=row_style)
+            text.append(f"[{value}]", style=value_style)
+            text.append("\n")
+            if selected:
+                text.append(f"    - {help_text}\n", style=RUN_HELP_STYLE)
+        return text
+
+    def _render_commands(self, settings: RunSettings) -> RenderableType:
+        commands = self._commands(settings)
+        text = Text()
+        text.append("Command preview\n", style="bold cyan")
+        text.append("Enter runs. E edits commands. S saves this list. F6 returns to summary.\n\n", style="dim")
+        if not commands:
+            text.append("(no commands)\n", style="dim")
+            return text
+        limit = 200
+        for index, command in enumerate(commands[:limit], start=1):
+            text.append(f"{index:>3}. ", style="dim")
+            text.append(command.shell_preview())
+            text.append("\n")
+        if len(commands) > limit:
+            text.append(f"... {len(commands) - limit} more command(s) not shown.\n", style="dim")
+        return text
+
+    def _commands(self, settings: RunSettings) -> list[PlannedCommand]:
+        key = settings.thread_count
+        if key not in self._command_cache:
+            self._command_cache[key] = planner.build_execution_plan(
+                self.plan,
+                self._base_dir(),
+                thread_count=settings.thread_count,
+            )
+        return self._command_cache[key]
+
+    def _base_dir(self) -> Path:
         app = self.app
-        base_dir = app.base_dir if isinstance(app, PlanUIApp) else Path.cwd()
+        return app.base_dir if isinstance(app, PlanUIApp) else Path.cwd()
 
-        preview = resume_utils.preview_resume(
-            self.plan,
-            base_dir=base_dir,
-            thread_count=settings.thread_count,
-        )
-        rows = resume_utils.command_rows(
-            self.plan,
-            base_dir=base_dir,
-            thread_count=settings.thread_count,
-        )
+    def _first_jobstore(self) -> str | None:
+        for round_entry in self.plan.rounds:
+            for step in (round_entry.blast_step, round_entry.align_step, *round_entry.hal2fasta_steps):
+                if step and step.jobstore:
+                    return step.jobstore
+        return None
 
-        next_row = next((row for row in rows if row.status != resume_utils.STATUS_COMPLETED), None)
-        header = Text()
-        header.append("Resume: ", style="bold cyan")
-        if not settings.resume:
-            header.append("disabled (full run)", style="dim")
-        elif next_row is None:
-            header.append("all steps are skippable (outputs present)", style="bold green")
-        else:
-            header.append(f"starts at step {next_row.index}: ", style="dim")
-            header.append(next_row.name, style="bold white")
-
-        if preview is None:
-            message = Panel(
-                "Unable to read run_state.json (missing or invalid). The plan will run in full; to resume, ensure the state file exists and is readable.",
-                border_style="yellow",
-            )
-            return Group(header, Text(""), message, resume_utils.render_command_table(rows, limit=200))
-
-        summary_table, state_panel = resume_utils.render_summary(preview)
-        warning: Panel | None = None
-        if not preview.plan_matches:
-            warning = Panel(
-                "Note: the plan signature in the state file does not match the current plan (thread count / edits can cause this).\n"
-                "Resume will skip only the contiguous completed prefix using command matching + output checks; once a step needs rerun, all subsequent steps will rerun.",
-                border_style="yellow",
-            )
-        parts: list[RenderableType] = [header, Text(""), summary_table, state_panel]
-        if warning is not None:
-            parts.insert(2, warning)
-        parts.append(resume_utils.render_command_table(rows, limit=200))
-        return Group(*parts)
-
-    def _render_flow_overview(self, settings: RunSettings) -> Panel:
-        # Header
-        header = Text()
-        header.append("Threads: ", style="dim")
-        header.append("auto" if settings.thread_count is None else str(settings.thread_count), style="bold white")
-        header.append("  Verbose: ", style="dim")
-        header.append("on" if settings.verbose else "off", style="bold green" if settings.verbose else "bold #aaaaaa")
-        
-        canvas_text = self._draw_dependency_tree()
-
-        content = Group(header, Text(""), canvas_text)
-        return Panel(content, title="[Execution Dependency Tree]", border_style="magenta", padding=(0, 1))
-
-    def _draw_dependency_tree(self) -> Text:
-        """
-        Builds a visual dependency tree of the Rounds based on input/output relationships.
-        Returns a Rich Text object containing the ASCII art.
-        """
-        if not self.plan.rounds:
-            return Text("No rounds planned.", style="dim red")
-
-        phylo_root = getattr(self.app, "alignment_tree", None)
-        if not phylo_root:
-            return Text("Phylogeny tree missing.", style="dim red")
-
-        def has_round(node: tree_utils.AlignmentNode) -> bool:
-            if node.round:
-                return True
-            return any(has_round(child) for child in node.children)
-
-        if not has_round(phylo_root.root):
-            return Text("No active rounds in tree.", style="dim yellow")
-
-        effective_ramax: dict[tree_utils.AlignmentNode, bool] = {}
-
-        def propagate_effective(node: tree_utils.AlignmentNode, covered: bool) -> None:
-            effective_ramax[node] = bool(node.round and (node.round.replace_with_ramax or covered))
-            subtree_cover = covered or bool(node.round and _is_subtree_mode_round(node.round))
-            for child in node.children:
-                propagate_effective(child, subtree_cover)
-
-        propagate_effective(phylo_root.root, False)
-
-        tee = "├─ "
-        elbow = "└─ "
-        pipe = "│  "
-        space = "   "
-        final_text = Text()
-
-        def append_label(line: Text, node: tree_utils.AlignmentNode) -> None:
-            if node.round:
-                if effective_ramax.get(node, False):
-                    line.append("R ", style="bold #f59e0b")
-                    line.append(_node_display_name(node), style="bold #fbbf24")
-                    if _is_subtree_mode_round(node.round):
-                        line.append("  subtree", style="dim #fbbf24")
-                else:
-                    line.append("C ", style="bold #22d3ee")
-                    line.append(_node_display_name(node), style="bold #67e8f9")
-            elif node.children:
-                line.append("◇ ", style="dim #7dd3fc")
-                line.append(_node_display_name(node), style="dim #93c5fd")
-            else:
-                line.append("L ", style="#86efac")
-                line.append(_node_display_name(node), style="#bbf7d0")
-
-        def walk(node: tree_utils.AlignmentNode, prefix: str, is_last: bool, depth: int) -> None:
-            connector = "" if depth == 0 else (elbow if is_last else tee)
-            line = Text()
-            line.append(prefix, style="#475569")
-            if connector:
-                line.append(connector, style="#475569")
-            append_label(line, node)
-            final_text.append_text(line)
-            final_text.append("\n")
-
-            children = node.children
-            for idx, child in enumerate(children):
-                child_prefix = prefix + (space if is_last else pipe)
-                walk(child, child_prefix, idx == len(children) - 1, depth + 1)
-
-        walk(phylo_root.root, "", True, 0)
-        return final_text
-
-    def _flow_preview_width(self) -> int:
+    def _preview_width(self) -> int:
         try:
             width = self.size.width
         except Exception:
             width = 80
-        return max(40, min(90, width - 18))
+        return max(40, min(120, width - 12))
 
     def _shorten(self, text: str, width: int) -> str:
         if len(text) <= width:
@@ -2044,12 +1668,12 @@ class RunSettingsScreen(Screen[RunSettings | None]):
 
 
 class RamaxOptionsModal(ModalScreen[tuple[list[str], list[str]] | None]):
-    """Modal dialog for editing global and per-round RaMAx options."""
+    """Keyboard-first editor for global and per-round RaMAx options."""
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("ctrl+s", "save", "Save"),
-        Binding("enter", "save", "Save"),
+        Binding("f6", "toggle_section", "Switch section"),
     ]
 
     CSS = """
@@ -2060,8 +1684,10 @@ class RamaxOptionsModal(ModalScreen[tuple[list[str], list[str]] | None]):
         padding: 1 2;
         width: 80%;
         max-width: 90;
+        height: 80%;
         border: round $accent;
         background: $panel;
+        layout: vertical;
     }
     #options-title {
         padding-bottom: 1;
@@ -2070,33 +1696,18 @@ class RamaxOptionsModal(ModalScreen[tuple[list[str], list[str]] | None]):
         padding-top: 1;
         padding-bottom: 0;
     }
-    .options-list {
-        layout: vertical;
-        gap: 1;
-        max-height: 12;
-        overflow-y: auto;
-        padding-top: 1;
-    }
-    .option-input {
+    .option-editor {
         width: 100%;
-    }
-    .option-empty {
-        color: $text-muted;
-    }
-    .button-row {
-        layout: horizontal;
-        gap: 1;
-        padding-top: 1;
-    }
-    #options-buttons {
-        layout: horizontal;
-        gap: 1;
-        padding-top: 1;
-        justify: end;
+        height: 1fr;
+        min-height: 5;
     }
     #options-status {
         padding-top: 1;
         color: $error;
+    }
+    #options-hint {
+        padding-top: 1;
+        color: $text-muted;
     }
     """
 
@@ -2104,108 +1715,287 @@ class RamaxOptionsModal(ModalScreen[tuple[list[str], list[str]] | None]):
         super().__init__()
         self._global_values = list(global_opts)
         self._round_values = list(round_opts)
-        self._global_container: Container | None = None
-        self._round_container: Container | None = None
+        self._global_editor: TextArea | None = None
+        self._round_editor: TextArea | None = None
         self._status: Static | None = None
+        self._active_section = "global"
 
     def compose(self) -> ComposeResult:
         with Container(id="options-dialog"):
             yield Static("Edit RaMAx options", id="options-title")
-            yield Static("Global options (plan.global_ramax_opts)", classes="section-label")
-            global_container = Container(id="global-options", classes="options-list")
-            self._global_container = global_container
-            yield global_container
-            with Container(id="global-buttons", classes="button-row"):
-                yield Button("Add global option", id="add-global", variant="success")
-                yield Button("Remove last global", id="remove-global", variant="warning")
-            yield Static("Current Round options (round.ramax_opts)", classes="section-label")
-            round_container = Container(id="round-options", classes="options-list")
-            self._round_container = round_container
-            yield round_container
-            with Container(id="round-buttons", classes="button-row"):
-                yield Button("Add Round option", id="add-round", variant="success")
-                yield Button("Remove last Round", id="remove-round", variant="warning")
+            yield Static("Global options (one option per line)", classes="section-label")
+            global_editor = TextArea(id="global-options-editor", classes="option-editor")
+            global_editor.text = "\n".join(self._global_values)
+            self._global_editor = global_editor
+            yield global_editor
+            yield Static("Current round options (one option per line)", classes="section-label")
+            round_editor = TextArea(id="round-options-editor", classes="option-editor")
+            round_editor.text = "\n".join(self._round_values)
+            self._round_editor = round_editor
+            yield round_editor
             status = Static("", id="options-status")
             self._status = status
             yield status
-            with Container(id="options-buttons"):
-                yield Button("Save", id="save-options", variant="success")
-                yield Button("Cancel", id="cancel-options")
+            yield Static("F6 switch section | Ctrl+S save | Esc back", id="options-hint")
 
     def on_mount(self) -> None:
-        self._refresh_inputs()
-
-    def _refresh_inputs(self) -> None:
-        if self._global_container:
-            for child in list(self._global_container.children):
-                child.remove()
-            if self._global_values:
-                inputs = [
-                    Input(value=value, placeholder="e.g. --threads=8", classes="option-input", id=f"global-{idx}")
-                    for idx, value in enumerate(self._global_values)
-                ]
-                self._global_container.mount(*inputs)
-            else:
-                self._global_container.mount(Static("(no global options)", classes="option-empty"))
-        if self._round_container:
-            for child in list(self._round_container.children):
-                child.remove()
-            if self._round_values:
-                inputs = [
-                    Input(value=value, placeholder="e.g. --input {}", classes="option-input", id=f"round-{idx}")
-                    for idx, value in enumerate(self._round_values)
-                ]
-                self._round_container.mount(*inputs)
-            else:
-                self._round_container.mount(Static("(no Round options)", classes="option-empty"))
-
-    def _sync_from_inputs(self) -> None:
-        if self._global_container:
-            self._global_values = self._collect_values(self._global_container, strip_empty=False)
-        if self._round_container:
-            self._round_values = self._collect_values(self._round_container, strip_empty=False)
-
-    def _collect_values(self, container: Container, strip_empty: bool) -> list[str]:
-        values: list[str] = []
-        for widget in container.query(Input):
-            value = widget.value if not strip_empty else widget.value.strip()
-            if strip_empty:
-                if value:
-                    values.append(value)
-            else:
-                values.append(value)
-        return values
+        if self._global_editor:
+            self._global_editor.focus()
 
     def action_save(self) -> None:
-        global_values = self._collect_values(self._global_container, strip_empty=True) if self._global_container else []
-        round_values = self._collect_values(self._round_container, strip_empty=True) if self._round_container else []
+        global_values = self._collect_editor_values(self._global_editor)
+        round_values = self._collect_editor_values(self._round_editor)
         self.dismiss((global_values, round_values))
 
     def action_cancel(self) -> None:
         self.dismiss(None)
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        button_id = event.button.id
-        if button_id == "save-options":
-            self.action_save()
-            return
-        if button_id == "cancel-options":
-            self.action_cancel()
-            return
-        self._sync_from_inputs()
-        if button_id == "add-global":
-            self._global_values.append("")
-        elif button_id == "remove-global":
-            if self._global_values:
-                self._global_values.pop()
-        elif button_id == "add-round":
-            self._round_values.append("")
-        elif button_id == "remove-round":
-            if self._round_values:
-                self._round_values.pop()
+    def action_toggle_section(self) -> None:
+        if self._active_section == "global":
+            self._active_section = "round"
+            if self._round_editor:
+                self._round_editor.focus()
         else:
+            self._active_section = "global"
+            if self._global_editor:
+                self._global_editor.focus()
+        self._update_status(f"Editing {self._active_section} options.")
+
+    def _collect_editor_values(self, editor: TextArea | None) -> list[str]:
+        if editor is None:
+            return []
+        return [line.strip() for line in editor.text.splitlines() if line.strip()]
+
+    def _update_status(self, message: str | None) -> None:
+        if self._status is not None:
+            self._status.update(message or "")
+
+
+class ExecutionScreen(Screen[str]):
+    """Run the plan inside Textual with progress, logs, and resource snapshots."""
+
+    BINDINGS = [
+        Binding("escape", "close_after_done", "Back when done"),
+        Binding("q", "close_after_done", "Back when done"),
+    ]
+
+    CSS = """
+    ExecutionScreen {
+        layout: vertical;
+        min-height: 0;
+    }
+    #exec-root {
+        layout: vertical;
+        height: 1fr;
+        min-height: 0;
+        padding: 1 2;
+    }
+    #exec-header {
+        height: auto;
+        padding-bottom: 0;
+    }
+    #exec-progress {
+        height: auto;
+        padding-bottom: 1;
+        color: $text-muted;
+    }
+    #exec-body {
+        layout: horizontal;
+        height: 1fr;
+        min-height: 0;
+    }
+    #exec-log {
+        width: 4fr;
+        height: 1fr;
+        border: round $accent;
+    }
+    #exec-side {
+        width: 1fr;
+        height: 1fr;
+        margin-left: 2;
+        padding: 1;
+        border: round $accent;
+        overflow-y: auto;
+    }
+    #exec-status {
+        height: 1;
+        width: 100%;
+        background: $panel;
+        padding: 0 1;
+        color: $text;
+    }
+    """
+
+    def __init__(self, plan: Plan, base_dir: Path, run_settings: RunSettings):
+        super().__init__()
+        self.plan = plan
+        self.base_dir = base_dir
+        self.run_settings = run_settings
+        self._events: queue.Queue[RunnerEvent] = queue.Queue()
+        self._done = False
+        self._failed = False
+        self._error: Exception | None = None
+        self._thread: threading.Thread | None = None
+        self._title: Static | None = None
+        self._progress: Static | None = None
+        self._log: RichLog | None = None
+        self._side: Static | None = None
+        self._status: Static | None = None
+        self._completed = 0
+        self._total = 0
+        self._current = ""
+        self._last_log_path: Path | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Container(id="exec-root"):
+            title = Static("Execution is starting...", id="exec-header")
+            self._title = title
+            yield title
+            progress = Static("Progress: 0/0 (0%)", id="exec-progress")
+            self._progress = progress
+            yield progress
+            with Container(id="exec-body"):
+                log = RichLog(id="exec-log", wrap=True, markup=True, max_lines=500)
+                self._log = log
+                yield log
+                side = Static("", id="exec-side")
+                self._side = side
+                yield side
+        status = Static("Running. Wait for completion; Q/Esc returns when done.", id="exec-status")
+        self._status = status
+        yield status
+
+    def on_mount(self) -> None:
+        if hasattr(self.app, "sub_title"):
+            self.app.sub_title = "Execution"
+        self.set_interval(0.2, self._drain_events)
+        self.set_interval(1.0, self._refresh_side)
+        self._thread = threading.Thread(target=self._run_plan, daemon=True)
+        self._thread.start()
+
+    def _run_plan(self) -> None:
+        try:
+            runner = PlanRunner(
+                self.plan,
+                base_dir=self.base_dir,
+                mirror_stdout=False,
+                run_settings=self.run_settings,
+                event_sink=self._events.put,
+            )
+            runner.run()
+        except Exception as exc:
+            self._error = exc
+            self._events.put(RunnerEvent(kind="ui_runner_error", message=str(exc)))
+
+    def _drain_events(self) -> None:
+        while True:
+            try:
+                event = self._events.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_event(event)
+
+    def _handle_event(self, event: RunnerEvent) -> None:
+        if event.total:
+            self._total = event.total
+        if event.log_path:
+            self._last_log_path = event.log_path
+        if event.kind == "plan_started":
+            self._write_log(f"[bold cyan]{event.message}[/]")
+        elif event.kind == "resume_notice":
+            self._write_log(f"[yellow]{event.message}[/]")
+        elif event.kind == "command_started":
+            self._current = event.display_name or ""
+            index = "" if event.command_index is None else f"{event.command_index + 1}/{event.total}"
+            self._write_log(f"[cyan]▶ {index} {self._current}[/]")
+            if event.message:
+                self._write_log(f"[dim]{event.message}[/]")
+        elif event.kind == "command_log":
+            if event.message:
+                self._write_log(event.message)
+        elif event.kind == "command_skipped":
+            self._completed += 1
+            self._write_log(f"[yellow]⏭ {event.message}[/]")
+        elif event.kind == "command_succeeded":
+            self._completed += 1
+            self._write_log(f"[green]✔ {event.message}[/]")
+        elif event.kind == "command_failed":
+            self._failed = True
+            self._write_log(f"[red]✖ {event.message}[/]")
+        elif event.kind == "plan_failed":
+            self._done = True
+            self._failed = True
+            self._write_log(f"[red]{event.message}[/]")
+        elif event.kind == "plan_completed":
+            self._done = True
+            self._write_log(f"[green]{event.message}[/]")
+        elif event.kind == "ui_runner_error":
+            self._done = True
+            if not self._failed:
+                self._failed = True
+                self._write_log(f"[red]{event.message}[/]")
+        if self._title:
+            state = "failed" if self._failed else "complete" if self._done else "running"
+            self._title.update(f"Execution {state}: {self._completed}/{self._total or '?'} complete")
+        self._refresh_progress()
+        if self._status:
+            if self._done:
+                self._status.update("Q/Esc back to planner")
+            else:
+                self._status.update("Running. Wait for completion; Q/Esc returns when done.")
+        self._refresh_side()
+
+    def _write_log(self, message: str) -> None:
+        if self._log:
+            self._log.write(message)
+
+    def _refresh_progress(self) -> None:
+        if not self._progress:
             return
-        self._refresh_inputs()
+        total = max(0, self._total)
+        completed = min(self._completed, total) if total else self._completed
+        percent = 0 if total == 0 else int((completed / total) * 100)
+        current = self._current or "-"
+        self._progress.update(f"Progress: {completed}/{total or '?'} ({percent}%) | Current: {current}")
+
+    def _refresh_side(self) -> None:
+        if not self._side:
+            return
+        metrics = self._collect_metrics()
+        lines = [
+            "[bold cyan]Status[/bold cyan]",
+            f"Result: {'failed' if self._failed else 'done' if self._done else 'running'}",
+            f"Completed: {self._completed}/{self._total or '?'}",
+            "",
+            "[bold cyan]Latest log[/bold cyan]",
+            f"Latest: {self._last_log_path or '-'}",
+            "",
+            "[bold cyan]Resources[/bold cyan]",
+            metrics,
+        ]
+        if self._done:
+            lines.extend(["", "Press Q or Esc to return to the planner."])
+        self._side.update("\n".join(lines))
+
+    def _collect_metrics(self) -> str:
+        try:
+            cpu = psutil.cpu_percent(interval=None)
+            mem = psutil.virtual_memory()
+            disk = psutil.disk_usage(self.base_dir)
+            return (
+                f"CPU: {cpu:.0f}%\n"
+                f"Memory: {mem.percent:.0f}% {mem.used / (1024**3):.1f}/{mem.total / (1024**3):.1f} GB\n"
+                f"Disk: {disk.percent:.0f}% {disk.used / (1024**3):.1f}/{disk.total / (1024**3):.1f} GB"
+            )
+        except Exception:
+            return "Resource snapshot unavailable"
+
+    def action_close_after_done(self) -> None:
+        if self._done:
+            self.dismiss("failed" if self._failed else "completed")
+        else:
+            self._write_log("[yellow]Execution is still running; wait for completion before leaving this screen.[/]")
 
 class PlanUIApp(App[UIResult]):
     CSS = """
@@ -2229,23 +2019,30 @@ class PlanUIApp(App[UIResult]):
         width: 100%;
         background: $bg-deep;
         overflow: hidden;
+        layout: horizontal;
+        min-height: 0;
     }
-    AsciiPhylo {
-        width: 100%;
+    PlanTreeBrowser {
+        width: 74%;
         height: 100%;
         background: $bg-deep;
-        padding: 1 2;
+        padding: 0 1;
     }
-    #ascii-phylo-empty {
+    DecisionPanel {
+        width: 26%;
+        background: $bg-panel;
+    }
+    #plan-tree-empty {
         align: center middle;
         color: #6b768f;
     }
-    DashboardHUD {
+    #status-bar {
         dock: bottom;
-        height: 13;
+        height: 1;
         width: 100%;
         background: $bg-panel;
-        border-top: heavy $border-bright;
+        padding: 0 1;
+        color: $text-main;
     }
     #editor-command { height: 10; }
 
@@ -2266,22 +2063,10 @@ class PlanUIApp(App[UIResult]):
     Input:focus {
         border: tall $accent-blue;
     }
-    Button {
-        border: none;
-        background: $bg-panel;
-        color: $text-main;
-    }
-    Button:hover {
-        background: $accent-blue;
-        color: #111;
-    }
-    Button.variant-success {
-        background: #a6e3a1;
-        color: #111;
-    }
     """
 
     BINDINGS = [
+        Binding("enter", "edit_round", "Edit command"),
         Binding("e", "edit_round", "Edit command"),
         Binding("r", "run_plan", "Run"),
         Binding("t", "mash_threshold", "Mash threshold"),
@@ -2291,46 +2076,51 @@ class PlanUIApp(App[UIResult]):
 
     def __init__(self, plan: Plan, base_dir: Optional[Path] = None, run_settings: Optional[RunSettings] = None):
         super().__init__()
+        self.title = "CAX"
+        self.sub_title = "Plan"
         self.plan = plan
         self.base_dir = Path(base_dir) if base_dir else Path.cwd()
         self.alignment_tree = tree_utils.build_alignment_tree(plan, base_dir=self.base_dir)
         self._run_state_path = self._resolve_run_state_path()
         self.resume_available = self._run_state_path.exists()
-        self.canvas: AsciiPhylo | None = None
+        self.canvas: PlanTreeBrowser | None = None
         self.run_settings = run_settings or RunSettings()
-        self.hud: DashboardHUD | None = None
+        self.decision_panel: DecisionPanel | None = None
+        self.status_bar: Static | None = None
         self._last_detail_text: str = ""
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Container(id="tree-container"):
             if self.alignment_tree:
-                canvas = AsciiPhylo(self.alignment_tree.root)
+                canvas = PlanTreeBrowser(self.alignment_tree.root)
                 canvas.set_detail_callback(self._on_node_selected)
                 self.canvas = canvas
                 yield canvas
+                decision_panel = DecisionPanel()
+                self.decision_panel = decision_panel
+                yield decision_panel
             else:
-                yield Static("Alignment tree not found; nothing to render.", id="ascii-phylo-empty")
-        hud = DashboardHUD()
-        self.hud = hud
-        yield hud
-        yield Footer()
+                yield Static("Alignment tree not found; nothing to render.", id="plan-tree-empty")
+        status_bar = Static("", id="status-bar")
+        self.status_bar = status_bar
+        yield status_bar
 
     def on_mount(self) -> None:
-        self.detail_panel = DetailBuffer(self)
         if self.canvas:
             self.canvas.focus()
             self._on_node_selected(self.canvas.current_node())
         else:
-            preview = plan_overview(self.plan, run_settings=self.run_settings, compact=self._is_compact())
-            self.detail_panel.update(preview)
+            self.sub_title = "Plan overview"
+            self._last_detail_text = "Alignment tree not found; nothing to render."
         
         if self.run_settings.resume and self.resume_available:
             # 断点续跑专属入口：直接进入运行设置/续跑摘要界面。
             self.set_timer(0.05, self.action_run_plan)
         else:
-            # Delay the welcome overlay slightly so the UI renders first.
-            self.set_timer(0.3, self._show_welcome_guide)
+            self._update_status_bar(
+                TREE_STATUS_HELP
+            )
 
     def _resolve_run_state_path(self) -> Path:
         if self.plan.out_dir:
@@ -2355,6 +2145,19 @@ class PlanUIApp(App[UIResult]):
     def _is_compact(self) -> bool:
         return self.size.width <= 100
 
+    def _set_header_for_node(self, node: tree_utils.AlignmentNode) -> None:
+        label = _node_display_name(node)
+        if node.round:
+            self.sub_title = f"{node.round.name} ({label})"
+        elif node.children:
+            self.sub_title = f"Clade {label}"
+        else:
+            self.sub_title = f"Leaf {label}"
+
+    def _update_status_bar(self, message: str) -> None:
+        if self.status_bar:
+            self.status_bar.update(message)
+
     def action_show_info(self) -> None:
         content = self._last_detail_text or "(empty)"
         self.push_screen(InfoModal("Current node details", content))
@@ -2362,8 +2165,7 @@ class PlanUIApp(App[UIResult]):
     def action_edit_round(self) -> None:
         if not self.plan.rounds:
             self._last_detail_text = "No rounds found in this plan."
-            if self.hud:
-                self.hud.update_message(self._last_detail_text)
+            self._update_status_bar(self._last_detail_text)
             return
         node_round = None
         if self.canvas:
@@ -2383,22 +2185,31 @@ class PlanUIApp(App[UIResult]):
             return
         self._start_round_edit(index)
 
-    def _start_round_edit(self, round_index: int) -> None:
+    def _start_round_edit(self, round_index: int, on_done: Optional[Callable[[], None]] = None) -> None:
         round_entry = self.plan.rounds[round_index]
         targets = self._gather_command_targets(round_entry)
         if not targets:
             self._last_detail_text = "No editable commands for this round."
-            if self.hud:
-                self.hud.update_message(self._last_detail_text)
+            self._update_status_bar(self._last_detail_text)
             return
         if len(targets) == 1:
-            self._open_command_editor(round_index, targets[0])
+            self._open_command_editor(round_index, targets[0], on_done=on_done)
         else:
-            self.push_screen(
-                CommandSelectionModal(targets),
-                lambda target: self._handle_command_selection(round_index, target),
-            )
+            self._open_command_target_picker(round_index, targets, on_done=on_done)
         self._show_round(round_index)
+
+    def _open_command_target_picker(
+        self,
+        round_index: int,
+        targets: list[CommandTarget],
+        *,
+        on_done: Optional[Callable[[], None]] = None,
+        initial_index: int = 0,
+    ) -> None:
+        self.push_screen(
+            CommandSelectionModal(targets, initial_index=initial_index),
+            lambda target: self._handle_command_selection(round_index, targets, target, on_done=on_done),
+        )
 
     def action_run_plan(self) -> None:
         screen = RunSettingsScreen(
@@ -2428,8 +2239,7 @@ class PlanUIApp(App[UIResult]):
         output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         if notify_detail:
             self._last_detail_text = f"[green]Commands saved to {output_path}[/green]"
-            if self.hud:
-                self.hud.update_message(self._last_detail_text)
+            self._update_status_bar(f"Commands saved to {output_path}")
         return output_path
 
     def action_quit(self) -> None:
@@ -2445,8 +2255,7 @@ class PlanUIApp(App[UIResult]):
         if self.run_settings.mash_auto and shutil.which("mash"):
             if self.is_running:
                 self._pending_mash_threshold = threshold
-                if self.hud:
-                    self.hud.update_message(f"Computing Mash distances for threshold={threshold:.4f}...")
+                self._update_status_bar(f"Computing Mash distances for threshold={threshold:.4f}...")
 
                 def work() -> mash_auto_module.MashAutoSummary:
                     preprocess_seq_file = seq_cache.find_preprocess_input_seq_file(self.plan, base_dir=self.base_dir)
@@ -2487,18 +2296,17 @@ class PlanUIApp(App[UIResult]):
             )
 
         if self.canvas:
-            self.canvas._rebuild_visual()
-            self.canvas.refresh()
+            self.canvas.rebuild_labels()
             self._on_node_selected(self.canvas.current_node(), status=status)
-        elif self.hud:
-            self.hud.update_message(status)
+        else:
+            self._update_status_bar(status)
 
     def on_worker_state_changed(self, message: Worker.StateChanged) -> None:
         if message.worker.name != "mash-threshold":
             return
-        if message.state == WorkerState.ERROR and self.hud:
+        if message.state == WorkerState.ERROR:
             error = message.worker.error
-            self.hud.update_message(f"[red]Mash computation failed: {error}[/red]")
+            self._update_status_bar(f"Mash computation failed: {error}")
             return
         if message.state != WorkerState.SUCCESS:
             return
@@ -2511,11 +2319,10 @@ class PlanUIApp(App[UIResult]):
             f"(pairs: +{summary.pairwise_computed}, cached {summary.pairwise_cached})."
         )
         if self.canvas:
-            self.canvas._rebuild_visual()
-            self.canvas.refresh()
+            self.canvas.rebuild_labels()
             self._on_node_selected(self.canvas.current_node(), status=status)
-        elif self.hud:
-            self.hud.update_message(status)
+        else:
+            self._update_status_bar(status)
 
     def _round_details(self, round_entry: Round) -> list[str]:
         details = [f"[bold]{round_entry.name}[/bold] root={round_entry.root}"]
@@ -2582,11 +2389,12 @@ class PlanUIApp(App[UIResult]):
         details = self._round_details(round_entry)
         if status:
             details.extend(["", f"[green]{status}[/green]"])
-        border_style = "green" if round_entry.replace_with_ramax else "cyan"
-        panel = Panel("\n".join(details), title=round_entry.name, border_style=border_style, padding=(1, 1))
         self._last_detail_text = "\n".join(details)
-        if self.hud:
-            self.hud.update_message(panel)
+        if self.canvas and self.canvas.current_node().round is round_entry:
+            self._set_header_for_node(self.canvas.current_node())
+        else:
+            self.sub_title = f"{round_entry.name} ({round_entry.root})"
+        self._update_status_bar(status or f"Selected round {round_entry.name}")
 
     def _gather_command_targets(self, round_entry: Round) -> list[CommandTarget]:
         targets: list[CommandTarget] = [
@@ -2676,23 +2484,55 @@ class PlanUIApp(App[UIResult]):
         if status:
             details.extend(["", f"[green]{status}[/green]"])
         self._last_detail_text = "\n".join(details)
-        if self.hud:
-            self.hud.update_message(Panel(self._last_detail_text, title=_node_display_name(node), border_style="green" if node.round and node.round.replace_with_ramax else "cyan", padding=(1, 1)))
+        self._set_header_for_node(node)
+        if self.decision_panel:
+            scope = self.canvas.current_scope() if self.canvas else "subtree"
+            self.decision_panel.update_node(
+                node,
+                scope=scope,
+                run_settings=self.run_settings,
+                status=status,
+            )
+        self._update_status_bar(status or TREE_STATUS_HELP)
 
-    def _handle_command_selection(self, round_index: int, target: CommandTarget | None) -> None:
+    def _handle_command_selection(
+        self,
+        round_index: int,
+        targets: list[CommandTarget],
+        target: CommandTarget | None,
+        on_done: Optional[Callable[[], None]] = None,
+    ) -> None:
         if target is None:
             return
-        self._open_command_editor(round_index, target)
+        try:
+            target_index = next(index for index, candidate in enumerate(targets) if candidate is target)
+        except StopIteration:
+            target_index = 0
+        self._open_command_editor(
+            round_index,
+            target,
+            on_done=on_done,
+            on_cancel=lambda: self._open_command_target_picker(
+                round_index,
+                targets,
+                on_done=on_done,
+                initial_index=target_index,
+            ),
+        )
 
     def _on_node_selected(
         self, node: tree_utils.AlignmentNode, status: str | None = None
     ) -> None:
-        """Tree navigation callback that drives HUD updates."""
+        """Tree navigation callback that drives the decision panel."""
         self._show_alignment_node(node, status=status)
-        if self.hud:
-            self.hud.update_node(node)
 
-    def _open_command_editor(self, round_index: int, target: CommandTarget) -> None:
+    def _open_command_editor(
+        self,
+        round_index: int,
+        target: CommandTarget,
+        on_done: Optional[Callable[[], None]] = None,
+        on_cancel: Optional[Callable[[], None]] = None,
+    ) -> None:
         if target.kind == "ramax-options":
             if round_index >= len(self.plan.rounds):
                 return
@@ -2702,19 +2542,39 @@ class PlanUIApp(App[UIResult]):
             )
             self.push_screen(
                 options_modal,
-                lambda result: self._apply_ramax_options(round_index, result),
+                lambda result: self._apply_ramax_options(
+                    round_index,
+                    result,
+                    on_done=on_done,
+                    on_cancel=on_cancel,
+                ),
             )
             return
         editor = CommandEditModal(f"Edit {target.label} command", target.command)
         self.push_screen(
             editor,
-            lambda new_command: self._apply_command_edit(round_index, target, new_command),
+            lambda new_command: self._apply_command_edit(
+                round_index,
+                target,
+                new_command,
+                on_done=on_done,
+                on_cancel=on_cancel,
+            ),
         )
 
     def _apply_command_edit(
-        self, round_index: int, target: CommandTarget, new_command: str | None
+        self,
+        round_index: int,
+        target: CommandTarget,
+        new_command: str | None,
+        on_done: Optional[Callable[[], None]] = None,
+        on_cancel: Optional[Callable[[], None]] = None,
     ) -> None:
-        if new_command is None or round_index >= len(self.plan.rounds):
+        if new_command is None:
+            if on_cancel:
+                on_cancel()
+            return
+        if round_index >= len(self.plan.rounds):
             return
         round_entry = self.plan.rounds[round_index]
         if target.kind == "ramax":
@@ -2722,27 +2582,54 @@ class PlanUIApp(App[UIResult]):
         elif target.step is not None:
             target.step.raw = new_command
         status = f"Updated {target.label} command"
+        if self.canvas:
+            self.canvas.rebuild_labels()
         self._show_round(round_index, status=status)
+        if on_done:
+            on_done()
 
     def _apply_ramax_options(
         self,
         round_index: int,
         result: tuple[list[str], list[str]] | None,
+        on_done: Optional[Callable[[], None]] = None,
+        on_cancel: Optional[Callable[[], None]] = None,
     ) -> None:
-        if result is None or round_index >= len(self.plan.rounds):
+        if result is None:
+            if on_cancel:
+                on_cancel()
+            return
+        if round_index >= len(self.plan.rounds):
             return
         global_opts, round_opts = result
         self.plan.global_ramax_opts = global_opts
         round_entry = self.plan.rounds[round_index]
         round_entry.ramax_opts = round_opts
         status = "RaMAx options updated"
+        if self.canvas:
+            self.canvas.rebuild_labels()
         self._show_round(round_index, status=status)
+        if on_done:
+            on_done()
 
     def _finalize_run_settings(self, result: RunSettings | None) -> None:
         if result is None:
             return
         self.run_settings = result
-        self.exit(UIResult(plan=self.plan, action="run", run_settings=self.run_settings))
+        self.push_screen(
+            ExecutionScreen(self.plan, self.base_dir, self.run_settings),
+            self._handle_execution_finished,
+        )
+
+    def _handle_execution_finished(self, result: str | None) -> None:
+        if result == "completed":
+            self.exit(UIResult(plan=self.plan, action="run_completed", run_settings=self.run_settings))
+            return
+        if result == "failed":
+            self.exit(UIResult(plan=self.plan, action="run_failed", run_settings=self.run_settings))
+            return
+        if result:
+            self._update_status_bar(f"Execution {result}.")
 
     def _ramax_command_preview(self, round_entry: Round) -> str:
         if round_entry.manual_ramax_command:

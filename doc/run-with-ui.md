@@ -10,11 +10,15 @@ Run the entry point directly:
 cax
 ```
 
-If you do not pass `--prepare-args` or `--from-file`, a Textual prompt opens so you can type or assemble a full `cactus-prepare` command.
+If you do not pass `--prepare-args` or `--from-file`, a Textual setup screen opens for the smallest required input: the species/seq file.
 
-- Press **F2** or type `:wizard` to open the argument wizard and fill `--outDir`, `--outSeqFile`, `--outHal`, and `--jobStore` one field at a time.
-- Press **F3** or type `:template` to choose from Evolver examples bundled with the package or from your own `~/.cax/templates.json`.
-- Press **F4** or type `!N`, for example `!1`, to recall the Nth entry from `~/.cax/history.json`. The prompt keeps the 20 most recent commands and lets you delete entries from the history window.
+- Use the arrow keys to select fields directly. When a completion list is open, **Up/Down** select candidates instead, and **PgUp/PgDn** pages through long candidate lists.
+- Type an input path and press **Tab** to complete it. In the advanced-args field, **Tab** completes options parsed from `cactus-prepare --help`. If the current field is already complete, **Tab** moves to the next field. If multiple candidates match, use **Up/Down** and **Enter** to choose.
+- CAX generates `--outDir`, `--outSeqFile`, `--outHal`, and `--jobStore` from the input filename. You can edit the output and temporary/jobStore directories before starting.
+- Use the other prepare advanced args field only for extra `cactus-prepare` flags such as `--defaultCores 32`.
+- Press **Enter** to start from any field when no candidate list is open.
+- Press **F3** to choose from Evolver examples bundled with the package or from your own `~/.cax/templates.json`.
+- Press **F4** to recall an entry from `~/.cax/history.json`. The setup screen keeps the 20 most recent commands and lets you delete entries from the history window.
 
 Scripted usage is also supported:
 
@@ -32,7 +36,7 @@ Pass `--threads 32` to seed the run-settings prompt so cactus steps inherit `--m
 
 ## Prepare and resume behavior
 
-Before running `cactus-prepare`, CAX infers the effective output directory from `--outDir` or the parent directory of `--outSeqFile`. It then offers to delete existing `--outDir` and `--jobStore` paths so the run starts cleanly.
+Before running `cactus-prepare`, CAX infers the effective output directory from the generated or supplied `--outDir`. It then offers to delete existing `--outDir` and `--jobStore` paths so the run starts cleanly.
 
 If `logs/run_state.json` is present and you choose to keep existing outputs, the UI opens directly into a resume view inside Run Settings. That view shows which steps can be skipped, which will rerun, and where execution resumes.
 
@@ -71,8 +75,8 @@ The right-hand detail pane shows the selected round's Mash distance when availab
 
 - Press **E** to edit commands for the selected round or RaMAx replacement in a multi-line editor. Press **Ctrl+S** to save.
 - Press **R** to open the Run Settings screen to review verbose logging and the shared thread count, run the plan, or save the generated command list.
-- The Run Settings screen is keyboard-driven with **Tab**, **Shift+Tab**, **Ctrl+Enter**, and **V**.
-- Press **F6** in Run Settings to switch between the classic plan overview and a flow view that renders the execution dependency tree in ASCII.
+- The Run Settings screen is keyboard-driven with **Up/Down**, **Enter/R**, **E**, **V**, and **S**.
+- Press **F6** in Run Settings to switch between the run summary and the generated command preview.
 - Press **Q** to quit the UI.
 
 Verbose streaming is controlled only through the run-settings dialog, so you can review the choice right before execution.
@@ -83,4 +87,4 @@ When RaMAx is enabled for a round or subtree, execution stops on the first failu
 
 Built-in templates are sourced from the packaged Evolver mammals/primates examples and any `.txt` files you add under `examples/`. User-defined templates live in `~/.cax/templates.json`.
 
-Command history is stored at `~/.cax/history.json`. It deduplicates consecutive runs, keeps up to 20 entries, and syncs with the Textual prompt so you can reuse or delete past commands.
+Command history is stored at `~/.cax/history.json`. It deduplicates consecutive runs, keeps up to 20 entries, and syncs with the Textual setup screen so you can reuse or delete past inputs.

@@ -14,7 +14,11 @@ from . import command_prompt, history, mash_auto as mash_auto_module, parser, se
 from .models import Plan, RunSettings
 from .runner import PlanRunner
 
-app = typer.Typer(help="Cactus-RaMAx interactive tools (ui only)")
+app = typer.Typer(
+    help="Cactus-RaMAx interactive tools",
+    invoke_without_command=True,
+    no_args_is_help=False,
+)
 
 
 def _load_prepare_text(
@@ -79,6 +83,23 @@ def _ensure_single_input(
     if from_file is not None:
         return "from_file"
     return "seqfile"
+
+
+@app.callback(invoke_without_command=True)
+def main(ctx: typer.Context) -> None:
+    """Launch the UI when `cax` is entered without a subcommand."""
+
+    if ctx.invoked_subcommand is None:
+        ui(
+            prepare_args=None,
+            from_file=None,
+            run_after=False,
+            threads=None,
+            mash_auto=True,
+            mash_threshold=0.02,
+            ask_mash=True,
+            cache_seqs=False,
+        )
 
 
 @app.command()
@@ -254,9 +275,14 @@ def ui(
     result = ui_module.launch(plan, run_settings=run_settings)
     plan = result.plan
     run_settings = result.run_settings or run_settings
-    if result.action == "run" or run_after:
-        if result.action != "run":
-            run_settings = _prompt_run_settings(run_settings, plan)
+    if result.action == "run_completed":
+        return
+    if result.action == "run_failed":
+        raise typer.Exit(code=1)
+    if result.action == "quit" and not run_after:
+        return
+    if run_after:
+        run_settings = _prompt_run_settings(run_settings, plan)
         runner = PlanRunner(plan, run_settings=run_settings)
         runner.run()
     else:
@@ -424,11 +450,6 @@ def auto(
     )
     runner = PlanRunner(plan, run_settings=run_settings)
     runner.run()
-
-
-if __name__ == "__main__":
-    app()
-
 
 def _prompt_run_settings(defaults: RunSettings, plan: Plan | None = None) -> RunSettings:
     """Collect run-time settings from the user just before execution."""
@@ -624,3 +645,7 @@ def _estimate_leaf_count(seq_file: Path) -> int:
             continue
         count += 1
     return count
+
+
+if __name__ == "__main__":
+    app()

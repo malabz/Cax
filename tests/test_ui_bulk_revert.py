@@ -1,5 +1,5 @@
 from cax import tree_utils
-from cax.ui import AsciiPhylo
+from cax.ui import PlanTreeBrowser
 from cax.models import Round
 
 
@@ -18,11 +18,11 @@ def _build_tree():
 
 def test_bulk_revert_when_toggling_child():
     root, child = _build_tree()
-    widget = AsciiPhylo(root)
+    widget = PlanTreeBrowser(root)
     # Simulate ancestor subtree mode
     assert "--subtree-mode" in root.round.ramax_opts
 
-    reverted = widget._maybe_revert_bulk(child)
+    reverted = widget._maybe_revert_subtree_ancestor(child)
 
     assert reverted is True
     assert root.round.replace_with_ramax is False

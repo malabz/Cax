@@ -105,7 +105,7 @@ When RaMAx is enabled for a round or subtree, execution stops on the first failu
 ## Templates and history
 
 - Built-in templates are sourced from the packaged Evolver mammals/primates examples and any `.txt` files you add under `examples/`; user-defined templates live in `~/.cax/templates.json`.
-- Command history is stored at `~/.cax/history.json`. It deduplicates consecutive runs, keeps up to 20 entries, and syncs with the Textual prompt so you can reuse or delete past commands.
+- Command history is stored at `~/.cax/history.json`. It deduplicates consecutive runs, keeps up to 20 entries, and syncs with the Textual setup screen so you can reuse or delete past inputs.
 
 ## Logging and troubleshooting
 

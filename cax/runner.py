@@ -10,7 +10,8 @@ from pathlib import Path
 import subprocess
 import threading
 import time
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
 
 import psutil
 from rich.console import Console
@@ -32,6 +33,20 @@ from .resume import (
 IMPORTANT_KEYWORDS = ("error", "failed", "exception", "critical")
 
 
+@dataclass
+class RunnerEvent:
+    """Structured execution event emitted by PlanRunner for UI consumers."""
+
+    kind: str
+    command_index: int | None = None
+    total: int | None = None
+    display_name: str | None = None
+    message: str = ""
+    log_path: Path | None = None
+    exit_code: int | None = None
+    metrics: dict[str, str] = field(default_factory=dict)
+
+
 class PlanRunner:
     """Run a :class:`~cax.models.Plan` sequentially with logging."""
 
@@ -42,6 +57,7 @@ class PlanRunner:
         env: Optional[dict[str, str]] = None,
         mirror_stdout: bool = True,
         run_settings: Optional[RunSettings] = None,
+        event_sink: Optional[Callable[[RunnerEvent], None]] = None,
     ):
         self.plan = plan
         self.base_dir = Path(base_dir) if base_dir else Path.cwd()
@@ -56,6 +72,11 @@ class PlanRunner:
         self.verbose = self.run_settings.verbose
         self.thread_count = self.run_settings.thread_count
         self.run_state_path = self.log_root / "run_state.json"
+        self.event_sink = event_sink
+
+    def _emit_event(self, event: RunnerEvent) -> None:
+        if self.event_sink is not None:
+            self.event_sink(event)
 
     def run(self, dry_run: Optional[bool] = None) -> None:
         """Execute the plan. When ``dry_run`` is True, commands are only logged."""
@@ -71,20 +92,34 @@ class PlanRunner:
         total_commands = len(planned_commands)
         completed_commands = 0
         failure_command: planner.PlannedCommand | None = None
+        self._emit_event(
+            RunnerEvent(
+                kind="plan_started",
+                total=total_commands,
+                message=f"Plan execution started: {total_commands} command(s).",
+                log_path=self.master_log_path,
+            )
+        )
 
         skip_enabled = self.run_settings.resume
         skipped_indices: set[int] = set()
         resume_start_index: int | None = None
         if skip_enabled:
-            if state.mismatched and self.mirror_stdout:
-                self.console.print(
-                    "[yellow][resume][/yellow] Found run_state.json, but the plan signature differs; will attempt command-matching resume."
+            if state.mismatched:
+                message = "Found run_state.json, but the plan signature differs; will attempt command-matching resume."
+                self._emit_event(
+                    RunnerEvent(kind="resume_notice", total=total_commands, message=message)
                 )
+                if self.mirror_stdout:
+                    self.console.print(f"[yellow][resume][/yellow] {message}")
             skipped_indices = state.compute_skips(planned_commands, self.base_dir)
-            if skipped_indices and self.mirror_stdout:
-                self.console.print(
-                    f"[yellow][resume][/yellow] Skipping {len(skipped_indices)} successful steps (run_state.json detected)."
+            if skipped_indices:
+                message = f"Skipping {len(skipped_indices)} successful steps (run_state.json detected)."
+                self._emit_event(
+                    RunnerEvent(kind="resume_notice", total=total_commands, message=message)
                 )
+                if self.mirror_stdout:
+                    self.console.print(f"[yellow][resume][/yellow] {message}")
             for idx in range(len(planned_commands)):
                 if idx not in skipped_indices:
                     resume_start_index = idx
@@ -128,6 +163,16 @@ class PlanRunner:
                         state.mark_skipped(cmd_id, command, command_index)
                         master_log.write(f"[resume] skip {command.display_name}: {command.shell_preview()}\n")
                         master_log.flush()
+                        self._emit_event(
+                            RunnerEvent(
+                                kind="command_skipped",
+                                command_index=command_index,
+                                total=total_commands,
+                                display_name=command.display_name,
+                                message=f"Skipped {command.display_name} (resume).",
+                                log_path=command.log_path,
+                            )
+                        )
                         if progress is not None and overall_task is not None:
                             remaining -= 1
                             progress.advance(overall_task)
@@ -146,6 +191,16 @@ class PlanRunner:
                         self._prepare_toil_jobstore(command, entry, allow_restart=allow_restart)
                     preview = command.shell_preview()
                     task_id: TaskID | None = None
+                    self._emit_event(
+                        RunnerEvent(
+                            kind="command_started",
+                            command_index=command_index,
+                            total=total_commands,
+                            display_name=command.display_name,
+                            message=preview,
+                            log_path=command.log_path,
+                        )
+                    )
                     if isinstance(progress, Progress):
                         progress.update(
                             overall_task,
@@ -165,9 +220,22 @@ class PlanRunner:
                         progress if isinstance(progress, Progress) else None,
                         task_id,
                         preview,
+                        command_index=command_index,
+                        total_commands=total_commands,
                     )
                     state.mark_result(cmd_id, command, command_index, success, exit_code)
                     if not success:
+                        self._emit_event(
+                            RunnerEvent(
+                                kind="command_failed",
+                                command_index=command_index,
+                                total=total_commands,
+                                display_name=command.display_name,
+                                message=f"{command.display_name} failed with exit code {exit_code}.",
+                                log_path=command.log_path,
+                                exit_code=exit_code,
+                            )
+                        )
                         if isinstance(progress, Progress):
                             progress.update(
                                 overall_task,
@@ -186,6 +254,18 @@ class PlanRunner:
                     completed_commands += 1
 
         if failure_command is not None:
+            self._emit_event(
+                RunnerEvent(
+                    kind="plan_failed",
+                    total=total_commands,
+                    display_name=failure_command.display_name,
+                    message=(
+                        f"Plan failed: {completed_commands}/{total_commands} commands succeeded. "
+                        f"Failed step: {failure_command.display_name}."
+                    ),
+                    log_path=failure_command.log_path or self.master_log_path,
+                )
+            )
             if self.mirror_stdout:
                 self.console.print(
                     f"[red]Plan failed[/red]: {completed_commands}/{total_commands} commands succeeded. "
@@ -196,6 +276,14 @@ class PlanRunner:
                 self.console.print(f"  • Master log: {self.master_log_path}")
             raise RuntimeError(f"Command failed: {failure_command.display_name}")
 
+        self._emit_event(
+            RunnerEvent(
+                kind="plan_completed",
+                total=total_commands,
+                message=f"Plan completed: {completed_commands}/{total_commands} commands succeeded.",
+                log_path=self.master_log_path,
+            )
+        )
         if self.mirror_stdout:
             self.console.print(
                 f"[green]Plan completed[/green]: {completed_commands}/{total_commands} commands succeeded."
@@ -210,6 +298,9 @@ class PlanRunner:
         progress: Optional[Progress],
         task_id,
         preview: Optional[str] = None,
+        *,
+        command_index: int | None = None,
+        total_commands: int | None = None,
     ) -> tuple[bool, int]:
         start_time = time.time()
         preview = preview or command.shell_preview()
@@ -231,6 +322,18 @@ class PlanRunner:
                 )
             elif self.mirror_stdout:
                 self.console.print(f"[yellow][skip][/yellow] {command.display_name} (dry-run {elapsed:.1f}s)")
+            self._emit_event(
+                RunnerEvent(
+                    kind="command_succeeded",
+                    command_index=command_index,
+                    total=total_commands,
+                    display_name=command.display_name,
+                    message=f"{command.display_name} dry-run complete in {elapsed:.1f}s.",
+                    log_path=command.log_path,
+                    exit_code=0,
+                    metrics=_basic_metric_fields(elapsed),
+                )
+            )
             return True, 0
 
         if command.workdir:
@@ -261,6 +364,8 @@ class PlanRunner:
                     progress,
                     task_id,
                     preview,
+                    command_index=command_index,
+                    total_commands=total_commands,
                 )
             assert proc.stdout is not None
             if progress is not None and task_id is not None:
@@ -272,8 +377,28 @@ class PlanRunner:
                 master_log.write(line)
                 if self.verbose:
                     self._emit_full(line)
+                    self._emit_event(
+                        RunnerEvent(
+                            kind="command_log",
+                            command_index=command_index,
+                            total=total_commands,
+                            display_name=command.display_name,
+                            message=line.rstrip(),
+                            log_path=step_log_path,
+                        )
+                    )
                 elif self._should_surface(line):
                     self._emit_important(line, progress)
+                    self._emit_event(
+                        RunnerEvent(
+                            kind="command_log",
+                            command_index=command_index,
+                            total=total_commands,
+                            display_name=command.display_name,
+                            message=line.rstrip(),
+                            log_path=step_log_path,
+                        )
+                    )
             return_code = proc.wait()
             duration = time.time() - start_time
             telemetry_fields: dict[str, str] = {}
@@ -306,6 +431,18 @@ class PlanRunner:
                 )
             elif self.mirror_stdout:
                 self.console.print(f"[green][end][/green] {command.display_name} ({duration:.1f}s)")
+            self._emit_event(
+                RunnerEvent(
+                    kind="command_succeeded",
+                    command_index=command_index,
+                    total=total_commands,
+                    display_name=command.display_name,
+                    message=f"{command.display_name} completed in {duration:.1f}s.",
+                    log_path=step_log_path,
+                    exit_code=return_code,
+                    metrics=telemetry_fields,
+                )
+            )
             return True, return_code
 
     def _log_dry_run(self, command: planner.PlannedCommand, preview: str) -> None:
@@ -334,6 +471,9 @@ class PlanRunner:
         progress: Optional[Progress],
         task_id,
         preview: str,
+        *,
+        command_index: int | None = None,
+        total_commands: int | None = None,
     ) -> tuple[bool, int]:
         hint = ""
         if exc.errno == errno.EACCES:
@@ -352,6 +492,17 @@ class PlanRunner:
             )
         elif self.mirror_stdout:
             self.console.print(f"[red]{message.rstrip()}[/red]")
+        self._emit_event(
+            RunnerEvent(
+                kind="command_log",
+                command_index=command_index,
+                total=total_commands,
+                display_name=command.display_name,
+                message=message.rstrip(),
+                log_path=command.log_path,
+                exit_code=-1,
+            )
+        )
         return False, -1
 
     def _emit_important(self, line: str, progress: Optional[Progress]) -> None:
