@@ -55,88 +55,28 @@ For older x86_64 CPUs without AVX2, use the legacy Cactus image:
 docker pull pingluzhang/cax:legacy
 ```
 
-Run the primate example:
+Run CAX from the image by mounting your working directory at `/data`. The container uses `/data` as both its working directory and home directory, so CAX outputs, logs, history, templates, and caches are written back to the mounted directory.
 
 ```bash
 docker run --rm -it \
+  --user "$(id -u):$(id -g)" \
   -v "$PWD:/data" \
   pingluzhang/cax:latest \
   auto --seqfile /data/examples/evolverPrimates.txt \
-  --mash-threshold 0.02
+  --mash-threshold 0.02 \
 ```
 
 For the interactive Textual UI:
 
 ```bash
 docker run --rm -it \
+  --user "$(id -u):$(id -g)" \
   -v "$PWD:/data" \
   pingluzhang/cax:latest
 ```
 
-Use `pingluzhang/cax:legacy` in the same commands on older CPUs. Add `--user "$(id -u):$(id -g)"` if you want output files to be owned by your host user instead of root.
+Use `pingluzhang/cax:legacy` in the same commands on older CPUs.
 
-### Build Docker Images Locally
-
-The Docker build includes CAX, Cactus v3.2.1, Mash, and a RaMAx binary compiled from source:
-
-```bash
-IMAGE=pingluzhang/cax
-VERSION=$(cat VERSION)
-
-docker build --platform linux/amd64 \
-  -t "${IMAGE}:${VERSION}" \
-  -t "${IMAGE}:latest" \
-  .
-```
-
-The build clones RaMAx from `https://github.com/pinglu-zhang/RaMAx.git` and compiles it with the same CMake settings used by the RaMAx Docker image. By default it builds the stable `master` branch. Pin another branch, tag, or commit with `RAMAX_REF`, or point at a fork with `RAMAX_REPOSITORY`:
-
-```bash
-docker build --platform linux/amd64 \
-  --build-arg RAMAX_REF=<branch-tag-or-commit> \
-  --build-arg BUILD_JOBS="$(nproc)" \
-  -t "${IMAGE}:${VERSION}" \
-  -t "${IMAGE}:latest" \
-  .
-```
-
-If you already downloaded the Cactus binary tarball, pass it into the build to avoid downloading it again:
-
-```bash
-docker build --platform linux/amd64 \
-  --build-arg CACTUS_TARBALL=cactus-bin-v3.2.1.tar.gz \
-  -t "${IMAGE}:${VERSION}" \
-  -t "${IMAGE}:latest" \
-  .
-```
-
-You can combine these build arguments, for example to use a local Cactus tarball and a pinned RaMAx source revision in the same image.
-
-Build the old-CPU image with:
-
-```bash
-./docker-build-legacy.sh
-```
-
-This tags the image as `pingluzhang/cax:<version>-legacy` and `pingluzhang/cax:legacy`. If `cactus-bin-legacy-v3.2.1.tar.gz` is present in the repository directory, the script reuses it; otherwise Docker downloads the legacy Cactus tarball during the build.
-
-To force a specific local tarball, including one outside the repository directory:
-
-```bash
-CACTUS_LEGACY_TARBALL=/path/to/cactus-bin-legacy-v3.2.1.tar.gz ./docker-build-legacy.sh
-```
-
-The equivalent explicit Docker command that downloads the legacy Cactus tarball is:
-
-```bash
-docker build --platform linux/amd64 \
-  --build-arg CACTUS_LEGACY=1 \
-  --build-arg RAMAX_REF=master \
-  --build-arg BUILD_JOBS="$(nproc)" \
-  -t pingluzhang/cax:$(cat VERSION)-legacy \
-  -t pingluzhang/cax:legacy \
-  .
-```
 
 ## Quick Start: Run the Primate Example
 
