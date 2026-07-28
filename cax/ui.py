@@ -25,7 +25,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from . import mash_auto as mash_auto_module, planner, seq_cache, tree_utils
+from . import mash_auto as mash_auto_module, planner, resources, seq_cache, tree_utils
 from .models import Plan, Round, RunSettings, Step
 from .planner import PlannedCommand
 from .runner import PlanRunner, RunnerEvent
@@ -141,7 +141,12 @@ def plan_overview(plan: Plan, run_settings: Optional[RunSettings] = None, compac
         if settings.thread_count is None
         else f"{settings.thread_count} threads (--maxCores/--threads)"
     )
-    footer_text = f"Verbose logging: {'on' if settings.verbose else 'off'} | Thread target: {thread_label}"
+    memory_label = resources.format_memory_size(settings.memory_limit_bytes)
+    source_label = settings.resource_budget.source if settings.resource_budget else "not detected"
+    footer_text = (
+        f"Verbose logging: {'on' if settings.verbose else 'off'} | "
+        f"CPU: {thread_label} | Memory: {memory_label} | Source: {source_label}"
+    )
     footer = Text(footer_text, style="dim")
     content = Group(table, footer)
     return Panel(content, border_style="magenta", expand=True)
@@ -417,6 +422,7 @@ class InfoModal(ModalScreen[None]):
 
 
 THREAD_AUTO = "auto"
+MEMORY_AUTO = "auto"
 
 
 class ThreadCountModal(ModalScreen[int | str | None]):
@@ -495,6 +501,87 @@ class ThreadCountModal(ModalScreen[int | str | None]):
             return
         if value <= 0:
             self._update_status("Thread count must be at least 1.")
+            return
+        self.dismiss(value)
+
+    def _update_status(self, message: str | None) -> None:
+        if self._status:
+            self._status.update(message or "")
+
+
+class MemoryLimitModal(ModalScreen[int | str | None]):
+    """Keyboard-first memory-limit editor."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    CSS = """
+    MemoryLimitModal {
+        align: center middle;
+    }
+    #memory-dialog {
+        padding: 1 2;
+        min-width: 50;
+        border: round $accent;
+        background: $panel;
+        layout: vertical;
+    }
+    #memory-title {
+        padding-bottom: 1;
+    }
+    #memory-input {
+        width: 100%;
+    }
+    #memory-hint {
+        padding-top: 1;
+        color: $text-muted;
+    }
+    #memory-status {
+        padding-top: 1;
+        color: $error;
+    }
+    """
+
+    def __init__(self, current: Optional[int]):
+        super().__init__()
+        self.current = current
+        self._input: Input | None = None
+        self._status: Static | None = None
+
+    def compose(self) -> ComposeResult:
+        with Container(id="memory-dialog"):
+            yield Static("Memory limit", id="memory-title")
+            input_widget = Input(
+                value="" if self.current is None else resources.format_memory_size(self.current),
+                placeholder="auto or a value such as 100Gi",
+                id="memory-input",
+            )
+            self._input = input_widget
+            yield input_widget
+            yield Static("Enter apply | empty/auto for detected limit | Esc back", id="memory-hint")
+            status = Static("", id="memory-status")
+            self._status = status
+            yield status
+
+    def on_mount(self) -> None:
+        if self._input:
+            self.set_focus(self._input)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "memory-input":
+            self._apply(event.value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _apply(self, raw: str) -> None:
+        text = raw.strip()
+        if not text or text.lower() in {"a", "auto"}:
+            self.dismiss(MEMORY_AUTO)
+            return
+        try:
+            value = resources.parse_memory_size(text)
+        except ValueError as exc:
+            self._update_status(str(exc))
             return
         self.dismiss(value)
 
@@ -1372,11 +1459,16 @@ class RunSettingsScreen(Screen[RunSettings | None]):
         self._view_mode: str = "summary"
         self._field_index = 0
         self._thread_text = "" if current.thread_count is None else str(current.thread_count)
+        self._memory_text = (
+            ""
+            if current.memory_limit_bytes is None
+            else resources.format_memory_size(current.memory_limit_bytes)
+        )
         self._verbose_enabled = current.verbose
         self._resume_enabled = current.resume
         self._previous_sub_title: str | None = None
         self._leaving_for_run = False
-        self._command_cache: dict[Optional[int], list[PlannedCommand]] = {}
+        self._command_cache: dict[tuple[Optional[int], Optional[int]], list[PlannedCommand]] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1420,13 +1512,40 @@ class RunSettingsScreen(Screen[RunSettings | None]):
     def _validate_threads(self) -> tuple[bool, Optional[int], Optional[str]]:
         text = self._thread_text.strip()
         if not text:
-            return True, None, None
+            detected = self.current.resource_budget
+            return True, detected.cpu_cores if detected else None, None
         try:
             value = int(text)
         except ValueError:
             return False, None, "Thread count must be a positive integer."
         if value <= 0:
             return False, None, "Thread count must be at least 1."
+        budget = self.current.resource_budget
+        if budget and value > budget.cpu_cores:
+            return (
+                False,
+                None,
+                f"Thread count cannot exceed the runtime budget ({budget.cpu_cores}).",
+            )
+        return True, value, None
+
+    def _validate_memory(self) -> tuple[bool, Optional[int], Optional[str]]:
+        text = self._memory_text.strip()
+        if not text:
+            budget = self.current.resource_budget
+            return True, budget.memory_bytes if budget else None, None
+        try:
+            value = resources.parse_memory_size(text)
+        except ValueError as exc:
+            return False, None, str(exc)
+        budget = self.current.resource_budget
+        if budget and value > budget.memory_bytes:
+            return (
+                False,
+                None,
+                "Memory limit cannot exceed the runtime budget "
+                f"({resources.format_memory_size(budget.memory_bytes)}).",
+            )
         return True, value, None
 
     def _refresh(self, message: str | None = None) -> None:
@@ -1449,8 +1568,18 @@ class RunSettingsScreen(Screen[RunSettings | None]):
         if not ok:
             self._refresh(error)
             return
+        memory_ok, memory_limit, memory_error = self._validate_memory()
+        if not memory_ok:
+            self._refresh(memory_error)
+            return
         settings = self._current_settings_preview()
         settings.thread_count = threads
+        settings.memory_limit_bytes = memory_limit
+        try:
+            self._commands(settings)
+        except resources.ResourceLimitError as exc:
+            self._refresh(f"Resource configuration error: {exc}")
+            return
         self._leaving_for_run = True
         self.dismiss(settings)
 
@@ -1466,11 +1595,19 @@ class RunSettingsScreen(Screen[RunSettings | None]):
         if not ok:
             self._refresh(error)
             return
+        memory_ok, _, memory_error = self._validate_memory()
+        if not memory_ok:
+            self._refresh(memory_error)
+            return
         app = self.app
         if not isinstance(app, PlanUIApp):
             self._refresh("Cannot save commands from this host.")
             return
-        path = app.export_commands(self._current_settings_preview(), notify_detail=False)
+        try:
+            path = app.export_commands(self._current_settings_preview(), notify_detail=False)
+        except resources.ResourceLimitError as exc:
+            self._refresh(f"Resource configuration error: {exc}")
+            return
         self._refresh(f"Commands saved to {path}" if path else "Failed to save commands.")
 
     def action_edit_commands(self) -> None:
@@ -1540,6 +1677,9 @@ class RunSettingsScreen(Screen[RunSettings | None]):
         if item == "threads":
             self.action_edit_threads()
             return
+        if item == "memory":
+            self.action_edit_memory()
+            return
         if item == "verbose":
             self.action_toggle_verbose()
             return
@@ -1578,12 +1718,44 @@ class RunSettingsScreen(Screen[RunSettings | None]):
             self._thread_text = ""
             self._refresh("Threads set to auto.")
             return
+        budget = self.current.resource_budget
+        if budget and result > budget.cpu_cores:
+            self._refresh(
+                f"Thread count cannot exceed the runtime budget ({budget.cpu_cores})."
+            )
+            return
         self._thread_text = str(result)
         self._refresh(f"Threads set to {result}.")
 
+    def action_edit_memory(self) -> None:
+        ok, memory_limit, _ = self._validate_memory()
+        current = memory_limit if ok else None
+        self.app.push_screen(MemoryLimitModal(current), self._handle_memory_limit)
+
+    def _handle_memory_limit(self, result: int | str | None) -> None:
+        if result is None:
+            self._refresh("Memory edit cancelled.")
+            return
+        if result == MEMORY_AUTO:
+            self._memory_text = ""
+            self._refresh("Memory set to detected limit.")
+            return
+        budget = self.current.resource_budget
+        if budget and result > budget.memory_bytes:
+            self._refresh(
+                "Memory limit cannot exceed the runtime budget "
+                f"({resources.format_memory_size(budget.memory_bytes)})."
+            )
+            return
+        self._memory_text = resources.format_memory_size(result)
+        self._refresh(f"Memory set to {self._memory_text}.")
+
     def _items(self) -> list[tuple[str, str, str, str, str]]:
         settings = self._current_settings_preview()
-        command_count = len(self._commands(settings))
+        try:
+            command_count = len(self._commands(settings))
+        except resources.ResourceLimitError:
+            command_count = 0
         items = [
             (
                 "run",
@@ -1616,9 +1788,24 @@ class RunSettingsScreen(Screen[RunSettings | None]):
             (
                 "threads",
                 "Threads",
-                "auto" if settings.thread_count is None else str(settings.thread_count),
+                (
+                    f"auto ({settings.thread_count})"
+                    if not self._thread_text.strip() and settings.thread_count is not None
+                    else ("auto" if settings.thread_count is None else str(settings.thread_count))
+                ),
                 "setting",
-                "Enter/Space edits; blank or auto keeps command defaults.",
+                "Enter/Space edits; auto uses the detected CPU limit.",
+            ),
+            (
+                "memory",
+                "Memory",
+                (
+                    f"auto ({resources.format_memory_size(settings.memory_limit_bytes)})"
+                    if not self._memory_text.strip() and settings.memory_limit_bytes is not None
+                    else resources.format_memory_size(settings.memory_limit_bytes)
+                ),
+                "setting",
+                "Enter/Space edits; auto uses the detected memory limit.",
             ),
             (
                 "verbose",
@@ -1654,9 +1841,13 @@ class RunSettingsScreen(Screen[RunSettings | None]):
     def _current_settings_preview(self) -> RunSettings:
         ok, threads, _ = self._validate_threads()
         thread_val = threads if ok else self.current.thread_count
+        memory_ok, memory_limit, _ = self._validate_memory()
+        memory_val = memory_limit if memory_ok else self.current.memory_limit_bytes
         return RunSettings(
             verbose=self._verbose_enabled,
             thread_count=thread_val,
+            memory_limit_bytes=memory_val,
+            resource_budget=self.current.resource_budget,
             resume=self._resume_enabled,
             mash_auto=self.current.mash_auto,
             mash_distance_threshold=self.current.mash_distance_threshold,
@@ -1669,7 +1860,12 @@ class RunSettingsScreen(Screen[RunSettings | None]):
         return self._render_summary(settings)
 
     def _render_summary(self, settings: RunSettings) -> RenderableType:
-        commands = self._commands(settings)
+        try:
+            commands = self._commands(settings)
+            resource_error = None
+        except resources.ResourceLimitError as exc:
+            commands = []
+            resource_error = str(exc)
         ramax_rounds = sum(1 for round_entry in self.plan.rounds if round_entry.replace_with_ramax)
         cactus_rounds = len(self.plan.rounds) - ramax_rounds
         text = Text()
@@ -1679,6 +1875,15 @@ class RunSettingsScreen(Screen[RunSettings | None]):
         text.append(f"    Rounds: {len(self.plan.rounds)}", style="bold white")
         text.append(f"    RaMAx: {ramax_rounds}", style="bold #f59e0b")
         text.append(f"    Cactus: {cactus_rounds}\n", style="bold #22d3ee")
+        if settings.resource_budget:
+            text.append("Resource source: ", style="dim")
+            text.append(f"{settings.resource_budget.source}\n")
+        text.append("CPU limit: ", style="dim")
+        text.append(f"{settings.thread_count or 'command default'}\n")
+        text.append("Memory limit: ", style="dim")
+        text.append(f"{resources.format_memory_size(settings.memory_limit_bytes)}\n")
+        if resource_error:
+            text.append(f"Resource error: {resource_error}\n", style="bold red")
         preview_width = self._preview_width()
         text.append("Output: ", style="dim")
         text.append(f"{self._shorten(self.plan.out_dir or '-', preview_width)}\n")
@@ -1712,10 +1917,14 @@ class RunSettingsScreen(Screen[RunSettings | None]):
         return text
 
     def _render_commands(self, settings: RunSettings) -> RenderableType:
-        commands = self._commands(settings)
         text = Text()
         text.append("Command preview\n", style="bold cyan")
         text.append("Enter runs. E edits commands. S saves this list. F6 returns to summary.\n\n", style="dim")
+        try:
+            commands = self._commands(settings)
+        except resources.ResourceLimitError as exc:
+            text.append(f"Resource configuration error: {exc}\n", style="bold red")
+            return text
         if not commands:
             text.append("(no commands)\n", style="dim")
             return text
@@ -1729,12 +1938,13 @@ class RunSettingsScreen(Screen[RunSettings | None]):
         return text
 
     def _commands(self, settings: RunSettings) -> list[PlannedCommand]:
-        key = settings.thread_count
+        key = (settings.thread_count, settings.memory_limit_bytes)
         if key not in self._command_cache:
             self._command_cache[key] = planner.build_execution_plan(
                 self.plan,
                 self._base_dir(),
                 thread_count=settings.thread_count,
+                memory_limit_bytes=settings.memory_limit_bytes,
             )
         return self._command_cache[key]
 
@@ -2329,6 +2539,11 @@ class PlanUIApp(App[UIResult]):
             self.plan,
             self.base_dir,
             thread_count=(settings.thread_count if settings else self.run_settings.thread_count),
+            memory_limit_bytes=(
+                settings.memory_limit_bytes
+                if settings
+                else self.run_settings.memory_limit_bytes
+            ),
         )
         lines = [cmd.shell_preview() for cmd in commands]
         output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -2727,12 +2942,11 @@ class PlanUIApp(App[UIResult]):
             self._update_status_bar(f"Execution {result}.")
 
     def _ramax_command_preview(self, round_entry: Round) -> str:
-        if round_entry.manual_ramax_command:
-            return round_entry.manual_ramax_command
         commands = planner.build_execution_plan(
             self.plan,
             self.base_dir,
             thread_count=self.run_settings.thread_count,
+            memory_limit_bytes=self.run_settings.memory_limit_bytes,
         )
         for command in commands:
             if command.is_ramax and command.round_name == round_entry.name:

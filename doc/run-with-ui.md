@@ -32,7 +32,14 @@ Or load an existing `cactus-prepare` output:
 cax --from-file steps-output/prepare_output.txt
 ```
 
-Pass `--threads 32` to seed the run-settings prompt so cactus steps inherit `--maxCores 32` and RaMAx receives `--threads 32`. Leave it unset to default to each command's original flag.
+CAX detects a CPU/memory budget before running `cactus-prepare`. Detection
+combines the process-visible host resources with CPU affinity,
+container/cgroup limits, and an active Slurm allocation, then uses the smallest
+known limits. Those values seed Run Settings and are applied to Cactus
+`--maxCores`/`--maxMemory` and RaMAx `--threads`.
+
+Pass `--threads 16` or `--memory-limit 80Gi` to select lower limits from the
+command line. A value above the detected runtime budget is rejected.
 
 ## Prepare and resume behavior
 
@@ -74,7 +81,7 @@ The right-hand detail pane shows the selected round's Mash distance when availab
 ## Edit, run, and export
 
 - Press **E** to edit commands for the selected round or RaMAx replacement in a multi-line editor. Press **Ctrl+S** to save.
-- Press **R** to open the Run Settings screen to review verbose logging and the shared thread count, run the plan, or save the generated command list.
+- Press **R** to open the Run Settings screen to review the detected resource source, CPU and memory limits, and verbose logging; from there you can run the plan or save the generated command list.
 - The Run Settings screen is keyboard-driven with **Up/Down**, **Enter/R**, **E**, **V**, and **S**.
 - Press **F6** in Run Settings to switch between the run summary and the generated command preview.
 - Press **Q** to quit the UI.

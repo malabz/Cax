@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-07-28
+
+### Resource limits
+- CAX now detects one effective CPU/memory budget from the local process, cgroup/container limits, and an active Slurm allocation, then applies the smallest known limits consistently.
+- `cactus-prepare` receives automatic `--defaultCores`/`--defaultMemory` values, while generated, loaded, edited, exported, and executed commands are capped with `--maxCores`, `--maxMemory`, and RaMAx `--threads`.
+- Run Settings displays the detected resource source and allows lower CPU/memory limits while rejecting values above the runtime budget. The CLI accepts `--memory-limit` alongside `--threads`.
+
+### Tests
+- Added coverage for local, nested cgroup, Slurm environment, `scontrol` fallback, prepare-option, planner, resume, CLI, and UI resource-limit behavior.
+- Validated `--mem` and `--mem-per-cpu` allocations on a live single-node Slurm installation; the complete Linux test suite passes with 88 tests.
+
 ## [0.6.1] - 2026-01-26
 
 ### Parser

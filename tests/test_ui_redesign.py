@@ -408,6 +408,8 @@ def test_run_settings_keyboard_fields_update_settings(tmp_path: Path):
             assert screen._thread_text == "24"
 
             await pilot.press("down")
+            assert screen._current_field_id() == "memory"
+            await pilot.press("down")
             assert screen._current_field_id() == "verbose"
             await pilot.press("space")
             assert screen._verbose_enabled is True
@@ -556,7 +558,12 @@ def test_run_settings_reuses_command_plan_while_navigating(tmp_path: Path, monke
     plan = _minimal_plan(tmp_path)
     calls: list[int | None] = []
 
-    def fake_build_execution_plan(plan_arg, base_dir, thread_count=None):
+    def fake_build_execution_plan(
+        plan_arg,
+        base_dir,
+        thread_count=None,
+        memory_limit_bytes=None,
+    ):
         calls.append(thread_count)
         return []
 
@@ -575,8 +582,11 @@ def test_run_settings_reuses_command_plan_while_navigating(tmp_path: Path, monke
                 await pilot.pause(0.01)
             assert calls == [None]
 
-            for _ in range(4):
+            for _ in range(10):
+                if screen._current_field_id() == "threads":
+                    break
                 await pilot.press("down")
+            assert screen._current_field_id() == "threads"
             await pilot.press("2")
             await pilot.pause(0.1)
             assert calls == [None, 2]

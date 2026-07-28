@@ -71,6 +71,7 @@ class PlanRunner:
         self.run_settings = run_settings or RunSettings()
         self.verbose = self.run_settings.verbose
         self.thread_count = self.run_settings.thread_count
+        self.memory_limit_bytes = self.run_settings.memory_limit_bytes
         self.run_state_path = self.log_root / "run_state.json"
         self.event_sink = event_sink
 
@@ -86,9 +87,16 @@ class PlanRunner:
             self.plan,
             self.base_dir,
             thread_count=self.thread_count,
+            memory_limit_bytes=self.memory_limit_bytes,
         )
         self.log_root.mkdir(parents=True, exist_ok=True)
-        state = _RunState(self.run_state_path, planned_commands, self.base_dir, self.thread_count)
+        state = _RunState(
+            self.run_state_path,
+            planned_commands,
+            self.base_dir,
+            self.thread_count,
+            self.memory_limit_bytes,
+        )
         total_commands = len(planned_commands)
         completed_commands = 0
         failure_command: planner.PlannedCommand | None = None
@@ -626,9 +634,15 @@ class _RunState:
         commands: list[planner.PlannedCommand],
         base_dir: Path,
         thread_count: Optional[int],
+        memory_limit_bytes: Optional[int],
     ) -> None:
         self.path = path
-        self.plan_signature = plan_signature(commands, base_dir, thread_count)
+        self.plan_signature = plan_signature(
+            commands,
+            base_dir,
+            thread_count,
+            memory_limit_bytes,
+        )
         self.state: dict[str, Any] = {"plan_signature": self.plan_signature, "commands": {}}
         self.mismatched = False
         loaded = self._load()

@@ -7,7 +7,7 @@ import shlex
 from typing import List, Optional
 
 from .models import Plan, Round, Step
-from . import tree_utils
+from . import resources, tree_utils
 
 
 @dataclass
@@ -33,6 +33,7 @@ def build_execution_plan(
     plan: Plan,
     base_dir: Optional[Path] = None,
     thread_count: Optional[int] = None,
+    memory_limit_bytes: Optional[int] = None,
 ) -> list[PlannedCommand]:
     """Materialise the full list of commands that should be executed."""
 
@@ -47,6 +48,7 @@ def build_execution_plan(
                 category="preprocess",
                 base_dir=base_dir,
                 thread_count=thread_count,
+                memory_limit_bytes=memory_limit_bytes,
             )
         )
 
@@ -57,7 +59,15 @@ def build_execution_plan(
         if _is_descendant_ramax(round_entry, tree):
             # An ancestor already uses RaMAx; running it again here would be redundant.
             continue
-        commands.extend(_round_commands(plan, round_entry, base_dir, thread_count))
+        commands.extend(
+            _round_commands(
+                plan,
+                round_entry,
+                base_dir,
+                thread_count,
+                memory_limit_bytes,
+            )
+        )
 
     for step in plan.hal_merges:
         replacement = _ramax_halmerge_replacement(step, plan, base_dir)
@@ -72,6 +82,7 @@ def build_execution_plan(
                     category="halmerge",
                     base_dir=base_dir,
                     thread_count=thread_count,
+                    memory_limit_bytes=memory_limit_bytes,
                 )
             )
             continue
@@ -83,6 +94,7 @@ def build_execution_plan(
                 category="halmerge",
                 base_dir=base_dir,
                 thread_count=thread_count,
+                memory_limit_bytes=memory_limit_bytes,
             )
         )
 
@@ -94,12 +106,20 @@ def _round_commands(
     round_entry: Round,
     base_dir: Path,
     thread_count: Optional[int],
+    memory_limit_bytes: Optional[int],
 ) -> list[PlannedCommand]:
     cmds: list[PlannedCommand] = []
     round_name = round_entry.name
 
     if round_entry.replace_with_ramax:
-        cmds.append(_ramax_command(plan, round_entry, base_dir, thread_count))
+        cmds.append(
+            _ramax_command(
+                plan,
+                round_entry,
+                base_dir,
+                thread_count,
+            )
+        )
     else:
         if round_entry.blast_step:
             cmds.append(
@@ -109,6 +129,7 @@ def _round_commands(
                     base_dir=base_dir,
                     round_name=round_name,
                     thread_count=thread_count,
+                    memory_limit_bytes=memory_limit_bytes,
                 )
             )
         if round_entry.align_step:
@@ -119,6 +140,7 @@ def _round_commands(
                     base_dir=base_dir,
                     round_name=round_name,
                     thread_count=thread_count,
+                    memory_limit_bytes=memory_limit_bytes,
                 )
             )
 
@@ -130,6 +152,7 @@ def _round_commands(
                 base_dir=base_dir,
                 round_name=round_name,
                 thread_count=thread_count,
+                memory_limit_bytes=memory_limit_bytes,
             )
         )
 
@@ -142,11 +165,16 @@ def _from_step(
     base_dir: Path,
     round_name: Optional[str] = None,
     thread_count: Optional[int] = None,
+    memory_limit_bytes: Optional[int] = None,
 ) -> PlannedCommand:
     command = _split_command(step.raw)
     if step.kind == "hal2fasta":
         command = _normalize_hal2fasta(command)
-    command = _ensure_cactus_threads(command, thread_count)
+    command = _apply_cactus_resource_limits(
+        command,
+        thread_count=thread_count,
+        memory_limit_bytes=memory_limit_bytes,
+    )
     log_path = Path(step.log_file) if step.log_file else None
     display_name = step.short_label()
     return PlannedCommand(
@@ -188,7 +216,7 @@ def _ramax_command(
             command.extend(["-w", workdir])
         command.extend(_filtered_ramax_opts(plan.global_ramax_opts))
         command.extend(_filtered_ramax_opts(round_entry.ramax_opts))
-        command = _ensure_ramax_threads(command, thread_count)
+    command = _ensure_ramax_threads(command, thread_count)
 
     log_path = _guess_ramax_log_path(plan, round_entry, base_dir)
 
@@ -282,16 +310,29 @@ def _normalize_hal2fasta(command: List[str]) -> List[str]:
     return cleaned
 
 
-def _ensure_cactus_threads(command: List[str], thread_count: Optional[int]) -> List[str]:
-    if thread_count is None or not command:
+def _apply_cactus_resource_limits(
+    command: List[str],
+    *,
+    thread_count: Optional[int],
+    memory_limit_bytes: Optional[int],
+) -> List[str]:
+    if not command:
         return command
     name = Path(command[0]).name
     if not name.startswith("cactus"):
         return command
-    if _has_flag(command, "--maxCores"):
-        return command
     adjusted = list(command)
-    adjusted.extend(["--maxCores", str(thread_count)])
+    if thread_count is not None:
+        adjusted = _cap_integer_option(adjusted, "--maxCores", thread_count, ensure=True)
+        adjusted = _cap_integer_option(adjusted, "--consCores", thread_count)
+        adjusted = _cap_integer_option(adjusted, "--lastzCores", thread_count)
+    if memory_limit_bytes is not None:
+        adjusted = _cap_memory_option(
+            adjusted,
+            "--maxMemory",
+            memory_limit_bytes,
+            ensure=True,
+        )
     return adjusted
 
 
@@ -307,10 +348,99 @@ def _ensure_ramax_threads(command: List[str], thread_count: Optional[int]) -> Li
     name = Path(command[0]).name.lower()
     if name != "ramax":
         return command
-    if _has_flag(command, "--threads"):
-        return command
+    return _cap_integer_option(command, "--threads", thread_count, ensure=True)
+
+
+def _cap_integer_option(
+    command: List[str],
+    flag: str,
+    limit: int,
+    *,
+    ensure: bool = False,
+) -> List[str]:
     adjusted = list(command)
-    adjusted.extend(["--threads", str(thread_count)])
+    found = False
+    index = 0
+    while index < len(adjusted):
+        token = adjusted[index]
+        if token == flag:
+            if index + 1 >= len(adjusted):
+                raise resources.ResourceLimitError(f"{flag} requires a value.")
+            found = True
+            raw = adjusted[index + 1]
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise resources.ResourceLimitError(
+                    f"{flag} must be a positive integer, got {raw!r}."
+                ) from exc
+            if value <= 0:
+                raise resources.ResourceLimitError(f"{flag} must be at least 1.")
+            if value > limit:
+                adjusted[index + 1] = str(limit)
+            index += 2
+            continue
+        if token.startswith(flag + "="):
+            found = True
+            raw = token.split("=", 1)[1]
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise resources.ResourceLimitError(
+                    f"{flag} must be a positive integer, got {raw!r}."
+                ) from exc
+            if value <= 0:
+                raise resources.ResourceLimitError(f"{flag} must be at least 1.")
+            if value > limit:
+                adjusted[index] = f"{flag}={limit}"
+        index += 1
+    if ensure and not found:
+        adjusted.extend([flag, str(limit)])
+    return adjusted
+
+
+def _cap_memory_option(
+    command: List[str],
+    flag: str,
+    limit: int,
+    *,
+    ensure: bool = False,
+) -> List[str]:
+    adjusted = list(command)
+    found = False
+    index = 0
+    formatted_limit = resources.format_memory_size(limit)
+    while index < len(adjusted):
+        token = adjusted[index]
+        if token == flag:
+            if index + 1 >= len(adjusted):
+                raise resources.ResourceLimitError(f"{flag} requires a value.")
+            found = True
+            raw = adjusted[index + 1]
+            try:
+                value = resources.parse_memory_size(raw)
+            except ValueError as exc:
+                raise resources.ResourceLimitError(
+                    f"Invalid {flag} value {raw!r}."
+                ) from exc
+            if value > limit:
+                adjusted[index + 1] = formatted_limit
+            index += 2
+            continue
+        if token.startswith(flag + "="):
+            found = True
+            raw = token.split("=", 1)[1]
+            try:
+                value = resources.parse_memory_size(raw)
+            except ValueError as exc:
+                raise resources.ResourceLimitError(
+                    f"Invalid {flag} value {raw!r}."
+                ) from exc
+            if value > limit:
+                adjusted[index] = f"{flag}={formatted_limit}"
+        index += 1
+    if ensure and not found:
+        adjusted.extend([flag, formatted_limit])
     return adjusted
 
 

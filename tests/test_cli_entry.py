@@ -25,6 +25,7 @@ def test_bare_cax_invokes_ui_defaults(monkeypatch):
             "from_file": None,
             "run_after": False,
             "threads": None,
+            "memory_limit": None,
             "mash_auto": True,
             "mash_threshold": 0.02,
             "ask_mash": True,

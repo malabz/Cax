@@ -1,6 +1,6 @@
 # Cactus-RaMAx
 
-Cactus-RaMAx helps you remix alignment plans emitted by `cactus-prepare`. You can inspect every round, toggle RaMAx for any subtree, and then run or export the resulting command list. The current version (`0.6.1`) keeps the ASCII phylogenetic canvas with subtree/single-node toggle scopes, search, proportional branch spacing, and a bottom HUD that summarizes the current node, coverage, and live system metrics. Subtree Mode is a CAX-only toggle that disables descendant RaMAx automatically and gracefully reverts if you later edit a child node.
+Cactus-RaMAx helps you remix alignment plans emitted by `cactus-prepare`. You can inspect every round, toggle RaMAx for any subtree, and then run or export the resulting command list. Version `0.7.0` adds runtime CPU and memory budgets for local hosts, containers/cgroups, and Slurm allocations, while retaining the ASCII phylogenetic canvas, subtree/single-node toggle scopes, search, proportional branch spacing, and bottom HUD. Subtree Mode is a CAX-only toggle that disables descendant RaMAx automatically and gracefully reverts if you later edit a child node.
 
 ![CAX interactive UI demo](doc/assets/cax-ui-demo.gif)
 
@@ -120,6 +120,14 @@ cax auto --from-file steps-output/prepare_output.txt
 
 Use `--no-ask-mash` to skip the Mash confirmation prompt. Use `--cache-seqs` to download remote URLs before Mash computation.
 
+CAX detects the CPU and memory available to the current process before it runs
+`cactus-prepare`. On a normal host it uses the process-visible CPU set and
+available memory; inside a container or Slurm allocation it also honors those
+harder limits. The detected budget is applied to Cactus `--maxCores` /
+`--maxMemory` and RaMAx `--threads`. Use `--threads N` or
+`--memory-limit 80Gi` to select a lower limit; values above the detected budget
+are rejected.
+
 ## Run With UI
 
 Run CAX without arguments to open the interactive Textual UI:
@@ -136,6 +144,10 @@ cax --from-file steps-output/prepare_output.txt
 ```
 
 Inside the UI, CAX renders the alignment tree, shows cactus vs. RaMAx state for each round, lets you toggle RaMAx replacements, and can run or export the generated command list. For the full UI workflow, keyboard shortcuts, Mash behavior, resume mode, templates, and history, see [Run with UI](doc/run-with-ui.md).
+
+The Run Settings screen shows the detected resource source and effective CPU
+and memory limits. Both values can be lowered before previewing, exporting, or
+running the final command list.
 
 When RaMAx is enabled for a round or subtree, execution stops on the first failure—it does not fall back to cactus `blast`/`align` automatically.
 

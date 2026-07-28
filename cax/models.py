@@ -7,6 +7,8 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .resources import ResourceBudget
+
 
 StepKind = Literal[
     "preprocess",
@@ -110,6 +112,8 @@ class RunSettings:
 
     verbose: bool = False
     thread_count: Optional[int] = None
+    memory_limit_bytes: Optional[int] = None
+    resource_budget: Optional[ResourceBudget] = None
     resume: bool = False
     mash_auto: bool = True
     mash_distance_threshold: float = 0.02

@@ -10,7 +10,16 @@ import typer
 from rich import print
 import shutil
 
-from . import command_prompt, history, mash_auto as mash_auto_module, parser, seq_cache, templates, ui as ui_module
+from . import (
+    command_prompt,
+    history,
+    mash_auto as mash_auto_module,
+    parser,
+    resources,
+    seq_cache,
+    templates,
+    ui as ui_module,
+)
 from .models import Plan, RunSettings
 from .runner import PlanRunner
 
@@ -85,6 +94,42 @@ def _ensure_single_input(
     return "seqfile"
 
 
+def _build_runtime_settings(
+    *,
+    threads: Optional[int],
+    memory_limit: Optional[str],
+    mash_auto: bool,
+    mash_threshold: float,
+) -> RunSettings:
+    """Detect and validate one stable resource budget for this CAX run."""
+
+    budget = resources.detect_runtime_budget()
+    try:
+        cpu_limit, memory_limit_bytes = resources.resolve_selected_limits(
+            budget,
+            threads=threads,
+            memory=memory_limit,
+        )
+    except ValueError as exc:
+        typer.echo(f"[cax] Resource configuration error: {exc}", err=True)
+        raise typer.Exit(code=2)
+
+    typer.echo(
+        "[cax] Runtime resource budget: "
+        f"{cpu_limit} CPU, {resources.format_memory_size(memory_limit_bytes)} memory "
+        f"({budget.source})."
+    )
+    return RunSettings(
+        verbose=False,
+        thread_count=cpu_limit,
+        memory_limit_bytes=memory_limit_bytes,
+        resource_budget=budget,
+        resume=False,
+        mash_auto=mash_auto,
+        mash_distance_threshold=mash_threshold,
+    )
+
+
 @app.callback(invoke_without_command=True)
 def main(ctx: typer.Context) -> None:
     """Launch the UI when `cax` is entered without a subcommand."""
@@ -95,6 +140,7 @@ def main(ctx: typer.Context) -> None:
             from_file=None,
             run_after=False,
             threads=None,
+            memory_limit=None,
             mash_auto=True,
             mash_threshold=0.02,
             ask_mash=True,
@@ -110,7 +156,12 @@ def ui(
     threads: Optional[int] = typer.Option(
         None,
         min=1,
-        help="Override cactus/RaMAx thread count for all steps (leave unset for command defaults)",
+        help="CPU limit for cactus/RaMAx (leave unset to use the detected runtime budget)",
+    ),
+    memory_limit: Optional[str] = typer.Option(
+        None,
+        "--memory-limit",
+        help="Memory limit such as 100Gi (leave unset to use the detected runtime budget)",
     ),
     mash_auto: bool = typer.Option(
         True,
@@ -151,8 +202,26 @@ def ui(
         prepare_args = prompt_result.args
         executable = prompt_result.executable or executable
 
+    run_settings = _build_runtime_settings(
+        threads=threads,
+        memory_limit=memory_limit,
+        mash_auto=mash_auto,
+        mash_threshold=mash_threshold,
+    )
+    if prepare_args is not None:
+        try:
+            prepare_args = resources.apply_prepare_resource_limits(
+                prepare_args,
+                cpu_limit=run_settings.thread_count or 1,
+                memory_limit_bytes=run_settings.memory_limit_bytes or 2**20,
+            )
+        except resources.ResourceLimitError as exc:
+            typer.echo(f"[cax] Resource configuration error: {exc}", err=True)
+            raise typer.Exit(code=2)
+
     out_dir_preview, job_store_preview = _prepare_plan_preview(executable, prepare_args, from_file)
     resume_preselected = _ensure_clean_environment(out_dir_preview, job_store_preview)
+    run_settings.resume = resume_preselected
     text = _load_prepare_text(prepare_args, from_file, executable=executable)
     plan = parser.parse_prepare_script(text)
 
@@ -263,14 +332,6 @@ def ui(
                         )
             else:
                 typer.echo("[cax] Skipped Mash distance computation. (You can still edit RaMAx selections manually.)")
-    run_settings = RunSettings(
-        verbose=False,
-        thread_count=threads,
-        resume=resume_preselected,
-        mash_auto=mash_auto,
-        mash_distance_threshold=mash_threshold,
-    )
-
     # 若用户在启动时选择保留 run_state，UI 会自动进入续跑专属界面（可查看已完成/待执行并微调后续命令）。
     result = ui_module.launch(plan, run_settings=run_settings)
     plan = result.plan
@@ -301,7 +362,12 @@ def auto(
     threads: Optional[int] = typer.Option(
         None,
         min=1,
-        help="Override cactus/RaMAx thread count for all steps (leave unset for command defaults)",
+        help="CPU limit for cactus/RaMAx (leave unset to use the detected runtime budget)",
+    ),
+    memory_limit: Optional[str] = typer.Option(
+        None,
+        "--memory-limit",
+        help="Memory limit such as 100Gi (leave unset to use the detected runtime budget)",
     ),
     mash_auto: bool = typer.Option(
         True,
@@ -340,6 +406,23 @@ def auto(
             raise typer.Exit(code=1)
         prepare_args = _build_prepare_args_from_seqfile(seqfile_path)
 
+    run_settings = _build_runtime_settings(
+        threads=threads,
+        memory_limit=memory_limit,
+        mash_auto=True,
+        mash_threshold=mash_threshold,
+    )
+    if prepare_args is not None:
+        try:
+            prepare_args = resources.apply_prepare_resource_limits(
+                prepare_args,
+                cpu_limit=run_settings.thread_count or 1,
+                memory_limit_bytes=run_settings.memory_limit_bytes or 2**20,
+            )
+        except resources.ResourceLimitError as exc:
+            typer.echo(f"[cax] Resource configuration error: {exc}", err=True)
+            raise typer.Exit(code=2)
+
     if not mash_auto:
         typer.echo("[cax] Auto mode requires Mash auto-selection. Remove --no-mash-auto.", err=True)
         raise typer.Exit(code=1)
@@ -355,6 +438,7 @@ def auto(
 
     out_dir_preview, job_store_preview = _prepare_plan_preview(executable, prepare_args, from_file)
     resume_preselected = _ensure_clean_environment(out_dir_preview, job_store_preview)
+    run_settings.resume = resume_preselected
     text = _load_prepare_text(prepare_args, from_file, executable=executable)
     plan = parser.parse_prepare_script(text)
 
@@ -441,13 +525,6 @@ def auto(
         )
         raise typer.Exit(code=1)
 
-    run_settings = RunSettings(
-        verbose=False,
-        thread_count=threads,
-        resume=resume_preselected,
-        mash_auto=True,
-        mash_distance_threshold=mash_threshold,
-    )
     runner = PlanRunner(plan, run_settings=run_settings)
     runner.run()
 
@@ -485,12 +562,54 @@ def _prompt_run_settings(defaults: RunSettings, plan: Plan | None = None) -> Run
         if value <= 0:
             typer.echo("[cax] Thread count must be at least 1.")
             continue
+        if defaults.resource_budget and value > defaults.resource_budget.cpu_cores:
+            typer.echo(
+                f"[cax] Thread count cannot exceed the runtime budget "
+                f"({defaults.resource_budget.cpu_cores})."
+            )
+            continue
         thread_count = value
+        break
+
+    memory_limit_bytes = defaults.memory_limit_bytes
+    while True:
+        default_memory = (
+            ""
+            if memory_limit_bytes is None
+            else resources.format_memory_size(memory_limit_bytes)
+        )
+        prompt = typer.prompt(
+            "Memory limit (blank = auto)",
+            default=default_memory,
+            show_default=bool(default_memory),
+        )
+        stripped = prompt.strip()
+        if not stripped:
+            memory_limit_bytes = (
+                defaults.resource_budget.memory_bytes
+                if defaults.resource_budget
+                else None
+            )
+            break
+        try:
+            value = resources.parse_memory_size(stripped)
+        except ValueError as exc:
+            typer.echo(f"[cax] {exc}")
+            continue
+        if defaults.resource_budget and value > defaults.resource_budget.memory_bytes:
+            typer.echo(
+                "[cax] Memory limit cannot exceed the runtime budget "
+                f"({resources.format_memory_size(defaults.resource_budget.memory_bytes)})."
+            )
+            continue
+        memory_limit_bytes = value
         break
 
     settings = RunSettings(
         verbose=verbose,
         thread_count=thread_count,
+        memory_limit_bytes=memory_limit_bytes,
+        resource_budget=defaults.resource_budget,
         resume=resume,
         mash_auto=defaults.mash_auto,
         mash_distance_threshold=defaults.mash_distance_threshold,

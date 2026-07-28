@@ -50,7 +50,7 @@ def command_canonical_preview(command: planner.PlannedCommand) -> str:
     """返回用于断点续跑匹配的“规范化命令”字符串。
 
     目标：允许用户调整线程数或仅修改后续步骤时，已完成步骤仍能被匹配并跳过。
-    - cactus*: 忽略 `--maxCores`（线程覆盖由 RunSettings 注入，改动不应导致续跑失效）
+    - cactus*: 忽略 `--maxCores` 和 `--maxMemory`（资源覆盖由 RunSettings 注入）
     - ramax: 忽略 `--threads`
     """
 
@@ -87,18 +87,24 @@ def preview_resume(
     *,
     base_dir: Optional[Path] = None,
     thread_count: Optional[int] = None,
+    memory_limit_bytes: Optional[int] = None,
 ) -> ResumePreview | None:
     """读取 run_state.json，返回续跑预览；文件缺失或无法解析时返回 None。"""
 
     base = Path(base_dir) if base_dir else Path.cwd()
-    commands = planner.build_execution_plan(plan, base, thread_count=thread_count)
+    commands = planner.build_execution_plan(
+        plan,
+        base,
+        thread_count=thread_count,
+        memory_limit_bytes=memory_limit_bytes,
+    )
     log_root = _log_root_for_plan(plan, base)
     state_path = log_root / "run_state.json"
     data = load_run_state_file(state_path)
     if not data:
         return None
 
-    current_sig = plan_signature(commands, base, thread_count)
+    current_sig = plan_signature(commands, base, thread_count, memory_limit_bytes)
     plan_matches = data.get("plan_signature") == current_sig
     entries = index_state_commands(data.get("commands", {}))
 
@@ -140,11 +146,17 @@ def command_rows(
     *,
     base_dir: Optional[Path] = None,
     thread_count: Optional[int] = None,
+    memory_limit_bytes: Optional[int] = None,
 ) -> list[CommandRow]:
     """返回每条命令的状态行，用于 UI 展示。"""
 
     base = Path(base_dir) if base_dir else Path.cwd()
-    commands = planner.build_execution_plan(plan, base, thread_count=thread_count)
+    commands = planner.build_execution_plan(
+        plan,
+        base,
+        thread_count=thread_count,
+        memory_limit_bytes=memory_limit_bytes,
+    )
     log_root = _log_root_for_plan(plan, base)
     state_path = log_root / "run_state.json"
     data = load_run_state_file(state_path)
@@ -252,10 +264,12 @@ def plan_signature(
     commands: list[planner.PlannedCommand],
     base_dir: Path,
     thread_count: Optional[int],
+    memory_limit_bytes: Optional[int] = None,
 ) -> str:
     hasher = hashlib.sha1()
     hasher.update(str(base_dir).encode())
     hasher.update(str(thread_count or "").encode())
+    hasher.update(str(memory_limit_bytes or "").encode())
     for cmd in commands:
         hasher.update(cmd.shell_preview().encode())
         if cmd.workdir:
@@ -309,6 +323,7 @@ def _canonical_shell_preview(tokens: list[str]) -> str:
     canonical_tokens = list(tokens)
     if name.startswith("cactus"):
         canonical_tokens = _strip_flag(canonical_tokens, "--maxCores")
+        canonical_tokens = _strip_flag(canonical_tokens, "--maxMemory")
         # Toil 的 `--restart` 属于“运行方式”而非产物语义，不应影响续跑匹配。
         canonical_tokens = _strip_switch(canonical_tokens, "--restart")
     if name == "ramax":
