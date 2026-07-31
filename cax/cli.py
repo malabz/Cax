@@ -1,6 +1,7 @@
 """Typer-powered command line interface for the streamlined CAX toolkit."""
 from __future__ import annotations
 
+from importlib import metadata
 from pathlib import Path
 import shlex
 import subprocess
@@ -15,6 +16,7 @@ from . import (
     history,
     mash_auto as mash_auto_module,
     parser,
+    planner,
     resources,
     seq_cache,
     templates,
@@ -28,6 +30,13 @@ app = typer.Typer(
     invoke_without_command=True,
     no_args_is_help=False,
 )
+
+
+def _version_callback(value: bool) -> None:
+    if not value:
+        return
+    typer.echo(f"CAX {metadata.version('cactus-ramax')}")
+    raise typer.Exit()
 
 
 def _load_prepare_text(
@@ -131,7 +140,16 @@ def _build_runtime_settings(
 
 
 @app.callback(invoke_without_command=True)
-def main(ctx: typer.Context) -> None:
+def main(
+    ctx: typer.Context,
+    version: bool = typer.Option(
+        False,
+        "--version",
+        callback=_version_callback,
+        is_eager=True,
+        help="Show the installed CAX version and exit.",
+    ),
+) -> None:
     """Launch the UI when `cax` is entered without a subcommand."""
 
     if ctx.invoked_subcommand is None:
@@ -369,6 +387,11 @@ def auto(
         "--memory-limit",
         help="Memory limit such as 100Gi (leave unset to use the detected runtime budget)",
     ),
+    export_commands: Optional[Path] = typer.Option(
+        None,
+        "--export-commands",
+        help="Write the final command list to PATH and exit without running the plan",
+    ),
     mash_auto: bool = typer.Option(
         True,
         "--mash-auto/--no-mash-auto",
@@ -394,7 +417,7 @@ def auto(
         ),
     ),
 ) -> None:
-    """Run cactus->RaMAx plan without launching the UI (Mash auto-selection required)."""
+    """Run or export a cactus->RaMAx plan without launching the UI."""
 
     input_kind = _ensure_single_input(prepare_args, from_file, seqfile)
     executable = "cactus-prepare"
@@ -436,9 +459,15 @@ def auto(
         )
         raise typer.Exit(code=1)
 
-    out_dir_preview, job_store_preview = _prepare_plan_preview(executable, prepare_args, from_file)
-    resume_preselected = _ensure_clean_environment(out_dir_preview, job_store_preview)
-    run_settings.resume = resume_preselected
+    if export_commands is None:
+        out_dir_preview, job_store_preview = _prepare_plan_preview(
+            executable,
+            prepare_args,
+            from_file,
+        )
+        run_settings.resume = _ensure_clean_environment(out_dir_preview, job_store_preview)
+    else:
+        run_settings.resume = False
     text = _load_prepare_text(prepare_args, from_file, executable=executable)
     plan = parser.parse_prepare_script(text)
 
@@ -524,6 +553,32 @@ def auto(
             err=True,
         )
         raise typer.Exit(code=1)
+
+    if export_commands is not None:
+        try:
+            commands = planner.build_execution_plan(
+                plan,
+                base_dir=base_dir,
+                thread_count=run_settings.thread_count,
+                memory_limit_bytes=run_settings.memory_limit_bytes,
+            )
+            output_path = export_commands.expanduser()
+            if not output_path.is_absolute():
+                output_path = base_dir / output_path
+            output_path = output_path.resolve()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                "\n".join(command.shell_preview() for command in commands) + "\n",
+                encoding="utf-8",
+            )
+        except resources.ResourceLimitError as exc:
+            typer.echo(f"[cax] Resource configuration error: {exc}", err=True)
+            raise typer.Exit(code=2)
+        except OSError as exc:
+            typer.echo(f"[cax] Failed to export commands: {exc}", err=True)
+            raise typer.Exit(code=1)
+        typer.echo(f"[cax] Exported {len(commands)} command(s) to {output_path}")
+        return
 
     runner = PlanRunner(plan, run_settings=run_settings)
     runner.run()

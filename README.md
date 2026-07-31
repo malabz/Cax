@@ -1,6 +1,6 @@
 # Cactus-RaMAx
 
-Cactus-RaMAx helps you remix alignment plans emitted by `cactus-prepare`. You can inspect every round, toggle RaMAx for any subtree, and then run or export the resulting command list. Version `0.7.0` adds runtime CPU and memory budgets for local hosts, containers/cgroups, and Slurm allocations, while retaining the ASCII phylogenetic canvas, subtree/single-node toggle scopes, search, proportional branch spacing, and bottom HUD. Subtree Mode is a CAX-only toggle that disables descendant RaMAx automatically and gracefully reverts if you later edit a child node.
+Cactus-RaMAx helps you remix alignment plans emitted by `cactus-prepare`. You can inspect every round, toggle RaMAx for any subtree, and then run or export the resulting command list. Version `0.7.1` adds non-UI final-command export and `cax --version`, building on the runtime CPU and memory budgets for local hosts, containers/cgroups, and Slurm allocations introduced in `0.7.0`. The ASCII phylogenetic canvas, subtree/single-node toggle scopes, search, proportional branch spacing, and bottom HUD remain unchanged. Subtree Mode is a CAX-only toggle that disables descendant RaMAx automatically and gracefully reverts if you later edit a child node.
 
 ![CAX interactive UI demo](doc/assets/cax-ui-demo.gif)
 
@@ -120,6 +120,18 @@ cax auto --from-file steps-output/prepare_output.txt
 
 Use `--no-ask-mash` to skip the Mash confirmation prompt. Use `--cache-seqs` to download remote URLs before Mash computation.
 
+To generate the final Mash-selected, resource-limited command list without
+executing it, provide an explicit output path:
+
+```bash
+cax auto --seqfile examples/evolverPrimates.txt --no-ask-mash \
+  --export-commands commands.txt
+```
+
+The export contains the same commands that auto mode would execute, one command
+per line. Export mode does not clean existing output/job-store directories and
+does not start the plan.
+
 CAX detects the CPU and memory available to the current process before it runs
 `cactus-prepare`. On a normal host it uses the process-visible CPU set and
 available memory; inside a container or Slurm allocation it also honors those
@@ -127,6 +139,12 @@ harder limits. The detected budget is applied to Cactus `--maxCores` /
 `--maxMemory` and RaMAx `--threads`. Use `--threads N` or
 `--memory-limit 80Gi` to select a lower limit; values above the detected budget
 are rejected.
+
+Show the installed CAX version with:
+
+```bash
+cax --version
+```
 
 ## Run With UI
 

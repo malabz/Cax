@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.1] - 2026-07-31
+
+### CLI
+- Added `cax auto --export-commands PATH` to write the final Mash-selected, resource-limited command list without executing or cleaning the plan output.
+- Added `cax --version` to report the installed CAX package version.
+
+### Tests
+- Added CLI coverage proving export mode applies final CPU/memory limits, skips output cleanup, and never starts `PlanRunner`; version reporting is also covered.
+
 ## [0.7.0] - 2026-07-28
 
 ### Resource limits
