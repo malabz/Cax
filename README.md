@@ -63,7 +63,7 @@ docker run --rm -it \
   -v "$PWD:/data" \
   pingluzhang/cax:latest \
   auto --seqfile /data/examples/evolverPrimates.txt \
-  --mash-threshold 0.02 \
+  --mash-threshold 0.04 \
 ```
 
 For the interactive Textual UI:
@@ -80,7 +80,7 @@ Use `pingluzhang/cax:legacy` in the same commands on older CPUs.
 
 ## Quick Start: Run the Primate Example
 
-Run this first to verify the installation:
+Run this first to verify the installation (the historical benchmark below used an explicit threshold of `0.02`; the current default is `0.04`):
 
 ```bash
 cax auto --seqfile examples/evolverPrimates.txt --mash-threshold 0.02
@@ -100,7 +100,7 @@ CAX replaced 2 of 3 Cactus alignment tasks with RaMAx in this example. In our te
 **Recommended short form (seqfile + threshold):**
 
 ```bash
-cax auto --seqfile examples/evolverPrimates.txt --mash-threshold 0.02
+cax auto --seqfile examples/evolverPrimates.txt --mash-threshold 0.04
 ```
 
 This auto-generates output paths using the seqfile stem:

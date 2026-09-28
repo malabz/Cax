@@ -53,7 +53,7 @@ After `cactus-prepare` completes, the UI displays the parsed plan and lets you t
 
 If `mash` is available on `PATH`, CAX can preselect RaMAx rounds automatically using Mash distance.
 
-- Defaults: `mash dist -k 31 -s 20000` and threshold `0.02`.
+- Defaults: `mash dist -k 31 -s 20000` and threshold `0.04`.
 - Override the threshold with `--mash-threshold 0.01`.
 - For each round, CAX checks pairwise leaf distances inside that subtree with early stop. If any pair exceeds the threshold, the round is not auto-enabled.
 - By default, CAX asks before computing Mash. Use `--no-ask-mash` to skip the prompt.

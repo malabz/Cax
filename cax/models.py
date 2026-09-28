@@ -116,4 +116,4 @@ class RunSettings:
     resource_budget: Optional[ResourceBudget] = None
     resume: bool = False
     mash_auto: bool = True
-    mash_distance_threshold: float = 0.02
+    mash_distance_threshold: float = 0.04

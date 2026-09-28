@@ -101,7 +101,7 @@ def apply_mash_distance_defaults(
     plan: Plan,
     *,
     base_dir: Optional[Path] = None,
-    threshold: float = 0.02,
+    threshold: float = 0.04,
     sequence_file: str | Path | None = None,
     k: int = DEFAULT_KMER,
     sketch_size: int = DEFAULT_SKETCH_SIZE,

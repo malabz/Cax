@@ -124,7 +124,7 @@ const heroCli = `# 解析 Cactus 规划拓扑
 $ cax --from-file prepare_output.txt
 
 # 一条命令自动缓存、筛选并执行
-$ cax auto --seqfile examples/evolverPrimates.txt --mash-threshold 0.02
+$ cax auto --seqfile examples/evolverPrimates.txt --mash-threshold 0.04
 
 # 打开交互式树界面
 $ cax`;
@@ -547,7 +547,7 @@ conda install -c bioconda mash
 pip install -e .`;
 
 const runCode = `# 自动生成输出路径并直接运行
-cax auto --seqfile examples/evolverPrimates.txt --mash-threshold 0.02
+cax auto --seqfile examples/evolverPrimates.txt --mash-threshold 0.04
 
 # 或打开交互式 UI
 cax`;

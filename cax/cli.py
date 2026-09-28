@@ -160,7 +160,7 @@ def main(
             threads=None,
             memory_limit=None,
             mash_auto=True,
-            mash_threshold=0.02,
+            mash_threshold=0.04,
             ask_mash=True,
             cache_seqs=False,
         )
@@ -190,10 +190,10 @@ def ui(
         ),
     ),
     mash_threshold: float = typer.Option(
-        0.02,
+        0.04,
         min=0.0,
         max=1.0,
-        help="Enable RaMAx when Mash distance <= threshold (default: 0.02).",
+        help="Enable RaMAx when Mash distance <= threshold (default: 0.04).",
     ),
     ask_mash: bool = typer.Option(
         True,
@@ -398,10 +398,10 @@ def auto(
         help="Auto-select RaMAx using Mash distance (required in auto mode).",
     ),
     mash_threshold: float = typer.Option(
-        0.02,
+        0.04,
         min=0.0,
         max=1.0,
-        help="Enable RaMAx when Mash distance <= threshold (default: 0.02).",
+        help="Enable RaMAx when Mash distance <= threshold (default: 0.04).",
     ),
     ask_mash: bool = typer.Option(
         True,

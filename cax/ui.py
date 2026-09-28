@@ -636,7 +636,7 @@ class MashThresholdModal(ModalScreen[float | None]):
             )
             threshold_input = Input(
                 value=f"{self.initial:.4f}",
-                placeholder="0.02",
+                placeholder="0.04",
                 id="mash-threshold",
             )
             self._input = threshold_input
@@ -668,7 +668,7 @@ class MashThresholdModal(ModalScreen[float | None]):
             try:
                 value = float(raw)
             except ValueError:
-                self._update_status("Threshold must be a number (for example 0.02).")
+                self._update_status("Threshold must be a number (for example 0.04).")
                 return
         if value < 0.0 or value > 1.0:
             self._update_status("Threshold must be between 0.0 and 1.0.")

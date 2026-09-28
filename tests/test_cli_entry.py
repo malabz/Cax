@@ -37,7 +37,7 @@ def test_bare_cax_invokes_ui_defaults(monkeypatch):
             "threads": None,
             "memory_limit": None,
             "mash_auto": True,
-            "mash_threshold": 0.02,
+            "mash_threshold": 0.04,
             "ask_mash": True,
             "cache_seqs": False,
         }
